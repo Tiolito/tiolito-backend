@@ -41,13 +41,8 @@ const JWT_SECRET = 'secreto_jwt';
 app.use(cors());
 app.use(express.json());
 
-// Configuración de la conexión a Supabase usando variables individuales
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: decodeURIComponent(process.env.DB_PASSWORD),
-  port: process.env.DB_PORT,
+  connectionString: process.env.DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
   }
