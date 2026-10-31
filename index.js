@@ -41,6 +41,13 @@ const JWT_SECRET = 'secreto_jwt';
 app.use(cors());
 app.use(express.json());
 
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
 // Ruta raíz de bienvenida
 app.get('/', (req, res) => {
   res.json({
