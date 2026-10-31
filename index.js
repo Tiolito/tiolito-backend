@@ -41,10 +41,31 @@ const JWT_SECRET = 'secreto_jwt';
 app.use(cors());
 app.use(express.json());
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
+// Ruta raíz de bienvenida
+app.get('/', (req, res) => {
+  res.json({
+    app: "Tiolito API",
+    estado: "¡Servidor funcionando al 100%!",
+    conexion: "Conectado a Supabase exitosamente"
+  });
+});
+
+// Ruta para probar la base de datos desde el navegador
+app.get('/api/test-db', async (req, res) => {
+  try {
+    const resultado = await pool.query('SELECT NOW()');
+    res.json({
+      exito: true,
+      mensaje: "¡Consulta a Supabase exitosa!",
+      tiempo_servidor_db: resultado.rows[0].now
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      exito: false,
+      error: "Error al consultar la base de datos",
+      detalles: error.message
+    });
   }
 });
 
