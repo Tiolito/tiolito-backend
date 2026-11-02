@@ -176,7 +176,7 @@ app.post('/api/login', async (req, res) => {
   { expiresIn: '2h' }
 );
 
-    return res.json({ success: true, token, role: user.role, user_id: user.id });
+    return res.json({ success: true, token, role: user.role, user_id: user.id, name: user.full_name });
 
   } catch (error) {
     console.error("ERROR EN EL LOGIN:", error);
