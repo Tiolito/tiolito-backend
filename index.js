@@ -142,7 +142,7 @@ app.get('/api/wallets/:user_id', async (req, res) => {
 // ENDPOINT: POST /api/login (Autenticación JWT)
 // ==========================================
 
-App.post('/api/login', async (req, res) => {
+app.post('/api/login', async (req, res) => {
   const phone_number = req.body.phone_number || req.body.email;
   const inputPassword = req.body.pin || req.body.password;
 
