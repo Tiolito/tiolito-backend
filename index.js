@@ -1119,8 +1119,8 @@ app.post('/api/agent/register-client', async (req, res) => {
   try {
     const { phone_number, full_name, pin } = req.body;
 
-    if (!phone_number || !full_name) {
-      return res.status(400).json({ success: false, error: "El teléfono y el nombre son obligatorios" });
+    if (!phone_number || !full_name || !pin) {
+      return res.status(400).json({ success: false, error: "El teléfono, nombre y PIN son obligatorios" });
     }
 
     // Verificar si el cliente ya existe
@@ -1129,10 +1129,13 @@ app.post('/api/agent/register-client', async (req, res) => {
       return res.status(400).json({ success: false, error: "El número de teléfono ya está registrado" });
     }
 
-    const defaultPin = pin || '1234';
+    // Cifrar el PIN de forma segura con bcrypt
+    const salt = await bcrypt.genSalt(10);
+    const pin_hash = await bcrypt.hash(pin, salt);
+
     const result = await pool.query(
-      'INSERT INTO users (phone_number, full_name, pin, role, balance) VALUES ($1, $2, $3, \'CLIENT\', 0.00) RETURNING id, phone_number, full_name',
-      [phone_number, full_name, defaultPin]
+      'INSERT INTO users (phone_number, full_name, pin_hash, role, balance) VALUES ($1, $2, $3, \'CLIENT\', 0.00) RETURNING id, phone_number, full_name',
+      [phone_number, full_name, pin_hash]
     );
 
     return res.json({ success: true, client: result.rows[0] });
