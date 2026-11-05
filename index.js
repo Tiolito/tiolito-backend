@@ -890,6 +890,37 @@ app.post('/api/cash-in', verifyToken, validarLimitesAML, async (req, res) => {
   }
 });
 
+// ==========================================
+// CÁLCULO DE COMISIONES Y REPARTO (CASH-OUT)
+// ==========================================
+function calcularYDividirComision(montoRetiro) {
+    let comisionTotal = 0;
+
+    // Rangos definidos para retiros (hasta Q2,000.00 máx)
+    if (montoRetiro <= 200.00) {
+        comisionTotal = 2.00;
+    } else if (montoRetiro <= 500.00) {
+        comisionTotal = 4.00;
+    } else if (montoRetiro <= 1000.00) {
+        comisionTotal = 8.00;
+    } else if (montoRetiro <= 2000.00) {
+        comisionTotal = 16.00;
+    } else {
+        throw new Error("El monto excede el límite máximo permitido por transacción (Q2,000.00).");
+    }
+
+    // Distribución exacta del porcentaje
+    const comisionAgente = Number((comisionTotal * 0.70).toFixed(2));  // 70% para el agente
+    const comisionTiolito = Number((comisionTotal * 0.30).toFixed(2)); // 30% para administración
+
+    return {
+        montoRetiro,
+        comisionTotal,
+        comisionAgente,
+        comisionTiolito
+    };
+}
+
 app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
   try {
     const targetPhone = req.body.client_phone || req.body.phone || req.body.phoneNumber || req.body.phone_number;
@@ -922,6 +953,12 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
       return res.status(400).json({ success: false, error: "Falta el teléfono o el monto" });
     }
 
+    const withdrawAmount = parseFloat(amount);
+
+    // 🚀 Calcular comisiones usando la función integrada
+    const comisiones = calcularYDividirComision(withdrawAmount);
+    const totalDescuentoCliente = withdrawAmount + comisiones.comisionTotal;
+
     // Buscar al cliente por número de teléfono
     const clientResult = await pool.query(
       'SELECT id, balance FROM users WHERE phone_number = $1',
@@ -935,36 +972,41 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
     const client = clientResult.rows[0];
     const client_id = client.id;
     const currentBalance = parseFloat(client.balance || 0);
-    const withdrawAmount = parseFloat(amount);
 
-    // Validar que el cliente tenga suficiente saldo
-    if (currentBalance < withdrawAmount) {
-      return res.status(400).json({ success: false, error: "Saldo insuficiente en la cuenta del cliente" });
+    // Validar que el cliente tenga suficiente saldo para el retiro + la comisión total
+    if (currentBalance < totalDescuentoCliente) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Saldo insuficiente. Necesitas Q${totalDescuentoCliente.toFixed(2)} (incluye Q${comisiones.comisionTotal.toFixed(2)} de comisión)` 
+      });
     }
 
-    const newBalance = currentBalance - withdrawAmount;
+    const newBalance = currentBalance - totalDescuentoCliente;
 
-    // Actualizar el saldo restando el retiro
+    // 1. Actualizar el saldo del cliente (restando retiro + comisión total)
     await pool.query(
       'UPDATE users SET balance = $1 WHERE id = $2',
       [newBalance, client_id]
     );
 
-    // Actualizar el saldo o acumulado del agente
-await pool.query(
-  'UPDATE users SET balance = balance + $1 WHERE id = $2', 
-  [withdrawAmount, agent_id]
-);
+    // 2. Actualizar el saldo del agente (le sumamos el retiro + su 70% de comisión)
+    const totalAbonoAgente = withdrawAmount + comisiones.comisionAgente;
+    await pool.query(
+      'UPDATE users SET balance = balance + $1 WHERE id = $2', 
+      [totalAbonoAgente, agent_id]
+    );
 
-await pool.query(
-        'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
-        [amount, agent_id]
-      );
+    await pool.query(
+      'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
+      [totalAbonoAgente, agent_id]
+    );
 
-      // 1. Generar folio único para el comprobante de Retiro
+    // Opcional: Podrías guardar la comisión de Tiolito (comisiones.comisionTiolito) en una tabla de ingresos/administración si lo deseas más adelante.
+
+    // 3. Generar folio único para el comprobante de Retiro
     const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    // Registrar la transacción de retiro (Agregando RETURNING id)
+    // Registrar la transacción de retiro (Guardamos el monto y la comisión generada)
     const txResult = await pool.query(
       "INSERT INTO transactions (agent_id, client_id, amount, type) VALUES ($1, $2, $3, 'CASH-OUT') RETURNING id, created_at",
       [agent_id, client_id, withdrawAmount]
@@ -982,10 +1024,10 @@ await pool.query(
     // 🚀 Avisar al cliente en tiempo real sobre el retiro
     io.to(`client_${client_id}`).emit('balance_updated', {
         type: "Retiro (Cash-Out)",
-        amount: amount,
+        amount: withdrawAmount,
+        commission: comisiones.comisionTotal,
         created_at: new Date()
     });
-
 
     // Consultar el nombre real del agente directamente de la base de datos
     const agentInfoRes = await pool.query('SELECT full_name FROM users WHERE id = $1', [agent_id]);
@@ -995,18 +1037,20 @@ await pool.query(
     const clientName = clientInfoRes.rows[0]?.full_name || 'Cliente';
     const clientPhone = targetPhone;
 
-    // 2. Retornar el objeto transaction con el nombre real del agente
+    // 4. Retornar la respuesta con el detalle financiero completo
     return res.json({
             success: true,
             new_balance: newBalance,
+            detalles_comision: comisiones,
             transaction: {
                 id: transactionIdShort,
                 folio: folioUnico,
                 type: "Retiro (Cash-Out)",
-                agent_name: realAgentName,   // 👈 Ahora trae el nombre real desde la BD
+                agent_name: realAgentName,   
                 client_name: clientName,     
                 client_phone: clientPhone,   
-                amount: amount,
+                amount: withdrawAmount,
+                commission: comisiones.comisionTotal,
                 created_at: new Date()
             }
     });
