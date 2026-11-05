@@ -1925,6 +1925,186 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     } finally {
         client.release();
     }
+}); 
+
+// ==========================================
+// 1. RETIRO EN PUNTO AGENTE (Enfocado en Comercios Pequeños)
+// ==========================================
+app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
+    const merchantId = req.user.id;
+    const { amount } = req.body;
+
+    const withdrawAmount = parseFloat(amount);
+    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
+        return res.status(400).json({ success: false, error: 'Monto de retiro inválido.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Obtener datos del comercio y su tipo (tier/merchant_type)
+        const merchantRes = await client.query(
+            'SELECT id, balance, merchant_type, tier FROM users WHERE id = $1 FOR UPDATE',
+            [merchantId]
+        );
+
+        if (merchantRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Comercio no encontrado.' });
+        }
+
+        const merchant = merchantRes.rows[0];
+        const merchantType = (merchant.merchant_type || merchant.tier || 'small').toLowerCase();
+
+        // 🛑 Comercios grandes deben canalizarse a transferencias bancarias por volumen de caja
+        if (merchantType === 'large' || merchantType === 'grande') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Por el volumen de tu negocio, utiliza la opción de Liquidación Bancaria (ACH).' 
+            });
+        }
+
+        // 🛡️ Límite por retiro individual para no desbancar a los puntos agentes locales
+        const MAX_RETIRO_AGENTE = 2500.00;
+        if (withdrawAmount > MAX_RETIRO_AGENTE) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `El límite máximo para retiro en efectivo en Punto Agente es de Q${MAX_RETIRO_AGENTE.toFixed(2)} por transacción.`
+            });
+        }
+
+        // Validar saldo disponible
+        const currentBalance = parseFloat(merchant.balance || 0);
+        if (currentBalance < withdrawAmount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente. Tu saldo disponible es de Q${currentBalance.toFixed(2)}.`
+            });
+        }
+
+        // 2. Generar código de retiro de 6 dígitos (Expira en 30 minutos)
+        const withdrawalCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+
+        // 3. Registrar el código de retiro en la base de datos
+        await client.query(
+            `INSERT INTO withdrawal_codes (code, client_id, amount, status, expires_at) 
+             VALUES ($1, $2, $3, 'PENDING', $4)`,
+            [withdrawalCode, merchantId, withdrawAmount, expiresAt]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            code: withdrawalCode,
+            amount: withdrawAmount,
+            message: 'Código de retiro generado exitosamente. Preséntalo en cualquier Punto Agente Tiolito (Válido por 30 min).'
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error al generar retiro en agente:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+
+// ==========================================
+// 2. SOLICITUD DE TRANSFERENCIA BANCARIA (ACH) (Habilitado para Small y Large)
+// ==========================================
+app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
+    const merchantId = req.user.id;
+    const { amount, bank_name, account_number, account_type } = req.body;
+
+    const withdrawAmount = parseFloat(amount);
+    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
+        return res.status(400).json({ success: false, error: 'Monto de retiro inválido.' });
+    }
+
+    if (!bank_name || !account_number) {
+        return res.status(400).json({ success: false, error: 'Proporciona el banco y el número de cuenta de destino.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Obtener datos y tipo del comercio
+        const merchantRes = await client.query(
+            'SELECT id, balance, merchant_type, tier, full_name FROM users WHERE id = $1 FOR UPDATE',
+            [merchantId]
+        );
+
+        if (merchantRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Comercio no encontrado.' });
+        }
+
+        const merchant = merchantRes.rows[0];
+        const merchantType = (merchant.merchant_type || merchant.tier || 'small').toLowerCase();
+
+        // 🛡️ Regla de negocio: Monto mínimo para liquidación bancaria según el tipo
+        const MINIMO_ACH_SMALL = 500.00; // Comercios pequeños a partir de Q500
+        if ((merchantType === 'small' || merchantType === 'pequeno') && withdrawAmount < MINIMO_ACH_SMALL) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `El monto mínimo para solicitar Transferencia Bancaria en Comercios Pequeños es de Q${MINIMO_ACH_SMALL.toFixed(2)}. Para montos menores, retira en efectivo en un Punto Agente.`
+            });
+        }
+
+        // Validar saldo suficiente
+        const currentBalance = parseFloat(merchant.balance || 0);
+        if (currentBalance < withdrawAmount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente. Tu saldo disponible es de Q${currentBalance.toFixed(2)}.`
+            });
+        }
+
+        // 2. Descontar el saldo al comercio de inmediato mientras se procesa la transferencia
+        await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [withdrawAmount, merchantId]);
+
+        // 3. Registrar la transacción pendiente de procesamiento ACH
+        const folioUnico = `ACH-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+        const txResult = await client.query(
+            `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at) 
+             VALUES ($1, $2, $3, $4, 'BANK-WITHDRAWAL-PENDING', NOW()) RETURNING id, created_at`,
+            [merchantId, merchantId, merchantId, withdrawAmount]
+        );
+
+        await client.query('COMMIT');
+
+        console.log(`📌 NUEVO RETIRO BANCARIO PENDIENTE (${merchantType.toUpperCase()}): ${merchant.full_name} solicita Q${withdrawAmount} a ${bank_name} No. ${account_number}`);
+
+        return res.json({
+            success: true,
+            folio: folioUnico,
+            amount: withdrawAmount,
+            detalles_cuenta: {
+                banco: bank_name,
+                cuenta: account_number,
+                tipo: account_type || 'Monetaria'
+            },
+            message: 'Solicitud de liquidación bancaria enviada con éxito. Se procesará hacia tu cuenta en horas hábiles.'
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error al procesar retiro bancario de comercio:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    } finally {
+        client.release();
+    }
 });
 
 // Iniciar servidor
