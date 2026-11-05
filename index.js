@@ -1001,9 +1001,38 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
       [totalAbonoAgente, agent_id]
     );
 
-    // Opcional: Podrías guardar la comisión de Tiolito (comisiones.comisionTiolito) en una tabla de ingresos/administración si lo deseas más adelante.
+    // ==========================================================
+    // 🚀 3. ABONAR AUTOMÁTICAMENTE EL 30% DE LA COMISIÓN A TIOLITO
+    // ==========================================================
+    try {
+      const adminResult = await pool.query(
+        "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
+      );
 
-    // 3. Generar folio único para el comprobante de Retiro
+      if (adminResult.rows.length > 0) {
+        const admin_id = adminResult.rows[0].id;
+
+        // Sumar el 30% a la cuenta users del admin
+        await pool.query(
+          'UPDATE users SET balance = balance + $1 WHERE id = $2',
+          [comisiones.comisionTiolito, admin_id]
+        );
+
+        // Sumar el 30% a la billetera (wallet) del admin si existe
+        try {
+          await pool.query(
+            'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
+            [comisiones.comisionTiolito, admin_id]
+          );
+        } catch (errWallet) {
+          // Ignora si la wallet del admin no aplica
+        }
+      }
+    } catch (adminErr) {
+      console.error("Error abonando comisión a administración:", adminErr.message);
+    }
+
+    // 4. Generar folio único para el comprobante de Retiro
     const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
     // Registrar la transacción de retiro (Guardamos el monto y la comisión generada)
@@ -1037,7 +1066,7 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
     const clientName = clientInfoRes.rows[0]?.full_name || 'Cliente';
     const clientPhone = targetPhone;
 
-    // 4. Retornar la respuesta con el detalle financiero completo
+    // 5. Retornar la respuesta con el detalle financiero completo
     return res.json({
             success: true,
             new_balance: newBalance,
