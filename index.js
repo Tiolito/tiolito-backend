@@ -1754,7 +1754,7 @@ app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// ENDPOINT: POST /api/client/pay-merchant (Pago del cliente a comercio con comisión 2.5%)
+// ENDPOINT: POST /api/client/pay-merchant (Pago a comercio con Dos Tipos de Comercio y Límites)
 // ==========================================
 app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     const clientId = req.user.id;
@@ -1784,7 +1784,61 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 2. Obtener datos del cliente pagador
+        // 2. Obtener datos y tipo del comercio receptor desde la base de datos
+        // Verificamos si tiene definido un merchant_type o tier ('small' o 'large'). Por defecto será 'small'.
+        const merchantRes = await client.query(
+            'SELECT id, full_name, merchant_type, tier FROM users WHERE id = $1', 
+            [merchantUserId]
+        );
+
+        if (merchantRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Comercio receptor no encontrado.' });
+        }
+
+        const merchantData = merchantRes.rows[0];
+        const merchantName = merchantData.full_name || 'Comercio Local';
+        
+        // Detectar tipo de comercio (soporta 'merchant_type' o 'tier')
+        const merchantType = (merchantData.merchant_type || merchantData.tier || 'small').toLowerCase();
+
+        // 🛡️ 3. APLICAR LÍMITES SEGÚN EL TIPO DE COMERCIO
+        let limiteMaxPerTx = 2500.00;
+        let limiteMaxDaily = 10000.00;
+        let tasaComision = 0.020; // 2.0% por defecto para pequeños
+
+        if (merchantType === 'large' || merchantType === 'grande') {
+            limiteMaxPerTx = 10000.00; // Límite mayor para grandes
+            limiteMaxDaily = 50000.00; // Límite diario mayor para grandes
+            tasaComision = 0.025;      // 2.5% estándar para grandes
+        }
+
+        // Validar límite por transacción individual
+        if (amountToPay > limiteMaxPerTx) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ 
+                success: false, 
+                error: `El monto excede el límite permitido para este tipo de comercio (Máx. Q${limiteMaxPerTx.toFixed(2)}).` 
+            });
+        }
+
+        // Consultar acumulado diario del comercio en transacciones de hoy
+        const ventasHoyRes = await client.query(
+            `SELECT COALESCE(SUM(amount), 0) AS total_hoy FROM transactions 
+             WHERE (merchant_id = $1 OR agent_id = $1) AND created_at::date = CURRENT_DATE`,
+            [merchantUserId]
+        );
+        const totalVentasHoy = parseFloat(ventasHoyRes.rows[0].total_hoy || 0);
+
+        if (totalVentasHoy + amountToPay > limiteMaxDaily) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ 
+                success: false, 
+                error: `El comercio ha alcanzado su límite diario acumulado permitido (Máx. Q${limiteMaxDaily.toFixed(2)}).` 
+            });
+        }
+
+        // 4. Obtener datos del cliente pagador
         const clientCheck = await client.query('SELECT id, full_name, phone_number, balance FROM users WHERE id = $1 FOR UPDATE', [clientId]);
         if (clientCheck.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -1798,36 +1852,20 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             return res.status(400).json({ success: false, error: `Saldo insuficiente. Tienes Q${clientBalance} y necesitas Q${amountToPay}.` });
         }
 
-        // 3. Obtener datos del comercio receptor
-        let merchantName = 'Comercio Local';
-        if (merchantUserId) {
-            const merchantCheck = await client.query('SELECT full_name FROM users WHERE id = $1', [merchantUserId]);
-            if (merchantCheck.rows.length > 0) {
-                merchantName = merchantCheck.rows[0].full_name;
-            }
-        }
-
-        // 🚀 CÁLCULO DE COMISIONES (2.5% para Tiolito Admin, 97.5% neto para el comercio)
-        const TASA_COMISION_COMERCIO = 0.025; 
-        const comisionTiolito = Number((amountToPay * TASA_COMISION_COMERCIO).toFixed(2));
+        // 🚀 5. CÁLCULO DINÁMICO DE COMISIONES (2.0% pequeños / 2.5% grandes)
+        const comisionTiolito = Number((amountToPay * tasaComision).toFixed(2));
         const montoNetoComercio = Number((amountToPay - comisionTiolito).toFixed(2));
 
-        // 4. Descontar el monto total al cliente
+        // 6. Descontar el monto total al cliente
         await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amountToPay, clientId]);
 
-        // 5. Acreditar el monto NETO al comercio (97.5%)
-        if (merchantUserId) {
-            await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [montoNetoComercio, merchantUserId]);
-            
-            // Si también manejas tabla de wallets separada para los comercios/usuarios:
-            try {
-                await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2', [montoNetoComercio, merchantUserId]);
-            } catch (eWallet) {
-                // Opcional si la tabla wallets aplica
-            }
-        }
+        // 7. Acreditar el monto NETO al comercio
+        await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [montoNetoComercio, merchantUserId]);
+        try {
+            await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2', [montoNetoComercio, merchantUserId]);
+        } catch (eWallet) {}
 
-        // 6. Acreditar el 100% de la comisión (2.5%) a Tiolito Admin automáticamente
+        // 8. Acreditar el 100% de la comisión a Tiolito Admin automáticamente
         const adminRes = await client.query(
             "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
         );
@@ -1839,18 +1877,18 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             } catch (eWalletAdmin) {}
         }
 
-        // 7. Registrar la transacción en la base de datos
+        // 9. Registrar la transacción en la base de datos
         const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         const txResult = await client.query(
-            `INSERT INTO transactions (agent_id, client_id, amount, type, created_at) 
-             VALUES ($1, $2, $3, 'MERCHANT-PAYMENT', NOW()) RETURNING id, created_at`,
-            [merchantUserId || clientId, clientId, amountToPay]
+            `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at) 
+             VALUES ($1, $2, $3, $4, 'MERCHANT-PAYMENT', NOW()) RETURNING id, created_at`,
+            [merchantUserId, clientId, merchantUserId, amountToPay]
         );
 
         await client.query('COMMIT');
 
-        // 8. ANULAR EL CÓDIGO INMEDIATAMENTE
+        // 10. ANULAR EL CÓDIGO INMEDIATAMENTE
         delete activeCharges[charge_code];
 
         const receiptPayload = {
@@ -1865,17 +1903,16 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             merchant_name: merchantName,
             merchantName: merchantName,                
             amount: amountToPay,
-            net_amount: montoNetoComercio,      // 👈 Monto que recibe limpio el comercio
-            commission: comisionTiolito,        // 👈 Comisión cobrada
+            net_amount: montoNetoComercio,      
+            commission: comisionTiolito,
+            merchant_type: merchantType,
             created_at: txResult.rows[0].created_at
         };
 
-        // 9. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
-        if (merchantUserId) {
-            io.to(`merchant_${merchantUserId}`).emit('payment_received', receiptPayload);
-        }
+        // 11. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
+        io.to(`merchant_${merchantUserId}`).emit('payment_received', receiptPayload);
 
-        // 10. Responder al cliente
+        // 12. Responder al cliente
         return res.json({
             success: true,
             transaction: receiptPayload
