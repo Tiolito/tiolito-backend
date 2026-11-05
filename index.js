@@ -1754,7 +1754,7 @@ app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// ENDPOINT: POST /api/client/pay-merchant (Pago del cliente a comercio)
+// ENDPOINT: POST /api/client/pay-merchant (Pago del cliente a comercio con comisión 2.5%)
 // ==========================================
 app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     const clientId = req.user.id;
@@ -1777,7 +1777,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         return res.status(400).json({ success: false, error: 'El código de cobro ha expirado (más de 5 minutos).' });
     }
 
-    const amountToPay = chargeInfo.amount;
+    const amountToPay = chargeInfo.amount; // Monto bruto que paga el cliente
     const merchantUserId = chargeInfo.merchantId;
 
     const client = await pool.connect();
@@ -1807,13 +1807,39 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             }
         }
 
-        // 4. Descontar al cliente y acreditar al comercio
+        // 🚀 CÁLCULO DE COMISIONES (2.5% para Tiolito Admin, 97.5% neto para el comercio)
+        const TASA_COMISION_COMERCIO = 0.025; 
+        const comisionTiolito = Number((amountToPay * TASA_COMISION_COMERCIO).toFixed(2));
+        const montoNetoComercio = Number((amountToPay - comisionTiolito).toFixed(2));
+
+        // 4. Descontar el monto total al cliente
         await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amountToPay, clientId]);
+
+        // 5. Acreditar el monto NETO al comercio (97.5%)
         if (merchantUserId) {
-            await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [amountToPay, merchantUserId]);
+            await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [montoNetoComercio, merchantUserId]);
+            
+            // Si también manejas tabla de wallets separada para los comercios/usuarios:
+            try {
+                await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2', [montoNetoComercio, merchantUserId]);
+            } catch (eWallet) {
+                // Opcional si la tabla wallets aplica
+            }
         }
 
-        // 5. Registrar la transacción
+        // 6. Acreditar el 100% de la comisión (2.5%) a Tiolito Admin automáticamente
+        const adminRes = await client.query(
+            "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
+        );
+        if (adminRes.rows.length > 0) {
+            const adminId = adminRes.rows[0].id;
+            await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [comisionTiolito, adminId]);
+            try {
+                await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2', [comisionTiolito, adminId]);
+            } catch (eWalletAdmin) {}
+        }
+
+        // 7. Registrar la transacción en la base de datos
         const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         const txResult = await client.query(
@@ -1824,34 +1850,36 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-// 6. ANULAR EL CÓDIGO INMEDIATAMENTE
-delete activeCharges[charge_code];
+        // 8. ANULAR EL CÓDIGO INMEDIATAMENTE
+        delete activeCharges[charge_code];
 
-const receiptPayload = {
-    folio: folioUnico,
-    id: txResult.rows[0].id,
-    type: 'Pago a Comercio',
-    sender_name: clientData.full_name,
-    senderName: clientData.full_name,          // 👈 Agregado para el frontend
-    clientName: clientData.full_name,          // 👈 Agregado para el frontend
-    full_name: clientData.full_name,
-    sender_phone: clientData.phone_number,
-    merchant_name: merchantName,
-    merchantName: merchantName,                // 👈 Agregado por consistencia
-    amount: amountToPay,
-    created_at: txResult.rows[0].created_at
-};
+        const receiptPayload = {
+            folio: folioUnico,
+            id: txResult.rows[0].id,
+            type: 'Pago a Comercio',
+            sender_name: clientData.full_name,
+            senderName: clientData.full_name,          
+            clientName: clientData.full_name,          
+            full_name: clientData.full_name,
+            sender_phone: clientData.phone_number,
+            merchant_name: merchantName,
+            merchantName: merchantName,                
+            amount: amountToPay,
+            net_amount: montoNetoComercio,      // 👈 Monto que recibe limpio el comercio
+            commission: comisionTiolito,        // 👈 Comisión cobrada
+            created_at: txResult.rows[0].created_at
+        };
 
-// 7. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
-if (merchantUserId) {
-    io.to(`merchant_${merchantUserId}`).emit('payment_received', receiptPayload);
-}
+        // 9. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
+        if (merchantUserId) {
+            io.to(`merchant_${merchantUserId}`).emit('payment_received', receiptPayload);
+        }
 
-// 8. Responder al cliente
-return res.json({
-    success: true,
-    transaction: receiptPayload
-});
+        // 10. Responder al cliente
+        return res.json({
+            success: true,
+            transaction: receiptPayload
+        });
 
     } catch (error) {
         await client.query('ROLLBACK');
