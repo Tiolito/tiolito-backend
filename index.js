@@ -171,13 +171,13 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '2h' }
     );
 
-    return res.json({ success: true, token, role: user.role, user_id: user.id, name: user.full_name });
+    return res.json({ success: true, token, role: user.role, user_id: user.id, name: user.full_name, tier: user.tier });
 
   } catch (error) {
     console.error("ERROR EN EL LOGIN:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
-});
+});  
 
 app.post('/api/register', async (req, res) => {
   const { phone_number, pin, full_name, role } = req.body;
