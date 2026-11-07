@@ -927,7 +927,7 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
     const amount = req.body.amount || req.body.monto;
 
     let agent_id = null;
-    let agentName = 'Punto Agente Tiolito'; // 👈 Definimos el valor por defecto aquí
+    let agentName = 'Punto Agente Tiolito';
     const authHeader = req.headers['authorization'];
   
     if (authHeader) {
@@ -936,7 +936,6 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
         const decoded = jwt.verify(token, 'secreto_jwt');
         agent_id = decoded.id || decoded.userId;
         
-        // 👈 ¡Atrapamos el nombre directamente del token al instante!
         if (decoded.name) {
           agentName = decoded.name;
         }
@@ -955,41 +954,57 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
 
     const withdrawAmount = parseFloat(amount);
 
-    // 🚀 Calcular comisiones usando la función integrada
-    const comisiones = calcularYDividirComision(withdrawAmount);
-    const totalDescuentoCliente = withdrawAmount + comisiones.comisionTotal;
-
-    // Buscar al cliente por número de teléfono
+    // 🔍 Buscar al usuario en la BD incluyendo su rol y tier
     const clientResult = await pool.query(
-      'SELECT id, balance FROM users WHERE phone_number = $1',
+      'SELECT id, balance, role, tier FROM users WHERE phone_number = $1',
       [targetPhone]
     );
 
     if (clientResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: "Cliente no encontrado" });
+      return res.status(404).json({ success: false, error: "Cliente o Comercio no encontrado" });
     }
 
     const client = clientResult.rows[0];
     const client_id = client.id;
+    const userRole = String(client.role || '').toUpperCase();
     const currentBalance = parseFloat(client.balance || 0);
 
-    // Validar que el cliente tenga suficiente saldo para el retiro + la comisión total
+    // 🚀 LÓGICA DE COMISIÓN INTELIGENTE:
+    // Si el usuario es COMERCIO (MERCHANT), NO le cobramos comisión (comisión = 0)
+    // Si es CLIENTE (CLIENT), mantiene el cálculo de comisión habitual.
+    let comisiones;
+    let totalDescuentoCliente;
+
+    if (userRole === 'MERCHANT' || userRole === 'COMERCIO') {
+      comisiones = {
+        comisionTotal: 0.00,
+        comisionAgente: 0.00,
+        comisionTiolito: 0.00
+      };
+      totalDescuentoCliente = withdrawAmount; // Descuento 1:1 sin recargo
+    } else {
+      comisiones = calcularYDividirComision(withdrawAmount);
+      totalDescuentoCliente = withdrawAmount + comisiones.comisionTotal;
+    }
+
+    // Validar que tenga suficiente saldo
     if (currentBalance < totalDescuentoCliente) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Saldo insuficiente. Necesitas Q${totalDescuentoCliente.toFixed(2)} (incluye Q${comisiones.comisionTotal.toFixed(2)} de comisión)` 
-      });
+      const errorMsg = (userRole === 'MERCHANT' || userRole === 'COMERCIO')
+        ? `Saldo insuficiente. Tu saldo disponible es de Q${currentBalance.toFixed(2)}.`
+        : `Saldo insuficiente. Necesitas Q${totalDescuentoCliente.toFixed(2)} (incluye Q${comisiones.comisionTotal.toFixed(2)} de comisión)`;
+
+      return res.status(400).json({ success: false, error: errorMsg });
     }
 
     const newBalance = currentBalance - totalDescuentoCliente;
 
-    // 1. Actualizar el saldo del cliente (restando retiro + comisión total)
+    // 1. Actualizar el saldo del cliente/comercio
     await pool.query(
       'UPDATE users SET balance = $1 WHERE id = $2',
       [newBalance, client_id]
     );
 
-    // 2. Actualizar el saldo del agente (le sumamos el retiro + su 70% de comisión)
+    // 2. Actualizar el saldo del agente (Se le entrega el monto del retiro + su % de comisión si aplicó)
     const totalAbonoAgente = withdrawAmount + comisiones.comisionAgente;
     await pool.query(
       'UPDATE users SET balance = balance + $1 WHERE id = $2', 
@@ -1001,41 +1016,38 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
       [totalAbonoAgente, agent_id]
     );
 
-    // ==========================================================
-    // 🚀 3. ABONAR AUTOMÁTICAMENTE EL 30% DE LA COMISIÓN A TIOLITO
-    // ==========================================================
-    try {
-      const adminResult = await pool.query(
-        "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
-      );
-
-      if (adminResult.rows.length > 0) {
-        const admin_id = adminResult.rows[0].id;
-
-        // Sumar el 30% a la cuenta users del admin
-        await pool.query(
-          'UPDATE users SET balance = balance + $1 WHERE id = $2',
-          [comisiones.comisionTiolito, admin_id]
+    // 3. ABONAR AUTOMÁTICAMENTE EL % CORRESPONDIENTE A TIOLITO (Solo si hubo comisión)
+    if (comisiones.comisionTiolito > 0) {
+      try {
+        const adminResult = await pool.query(
+          "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
         );
 
-        // Sumar el 30% a la billetera (wallet) del admin si existe
-        try {
+        if (adminResult.rows.length > 0) {
+          const admin_id = adminResult.rows[0].id;
+
           await pool.query(
-            'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
+            'UPDATE users SET balance = balance + $1 WHERE id = $2',
             [comisiones.comisionTiolito, admin_id]
           );
-        } catch (errWallet) {
-          // Ignora si la wallet del admin no aplica
+
+          try {
+            await pool.query(
+              'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
+              [comisiones.comisionTiolito, admin_id]
+            );
+          } catch (errWallet) {
+            // Ignora si no aplica wallet
+          }
         }
+      } catch (adminErr) {
+        console.error("Error abonando comisión a administración:", adminErr.message);
       }
-    } catch (adminErr) {
-      console.error("Error abonando comisión a administración:", adminErr.message);
     }
 
     // 4. Generar folio único para el comprobante de Retiro
     const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    // Registrar la transacción de retiro (Guardamos el monto y la comisión generada)
     const txResult = await pool.query(
       "INSERT INTO transactions (agent_id, client_id, amount, type) VALUES ($1, $2, $3, 'CASH-OUT') RETURNING id, created_at",
       [agent_id, client_id, withdrawAmount]
@@ -1050,7 +1062,7 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
       );
     }
 
-    // 🚀 Avisar al cliente en tiempo real sobre el retiro
+    // Avisar al usuario en tiempo real sobre el retiro
     io.to(`client_${client_id}`).emit('balance_updated', {
         type: "Retiro (Cash-Out)",
         amount: withdrawAmount,
@@ -1058,7 +1070,7 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
         created_at: new Date()
     });
 
-    // Consultar el nombre real del agente directamente de la base de datos
+    // Consultar el nombre real del agente y del cliente
     const agentInfoRes = await pool.query('SELECT full_name FROM users WHERE id = $1', [agent_id]);
     const realAgentName = agentInfoRes.rows[0]?.full_name || agentName || 'Punto Agente Tiolito';
 
@@ -1066,28 +1078,28 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
     const clientName = clientInfoRes.rows[0]?.full_name || 'Cliente';
     const clientPhone = targetPhone;
 
-    // 5. Retornar la respuesta con el detalle financiero completo
+    // 5. Retornar la respuesta
     return res.json({
-            success: true,
-            new_balance: newBalance,
-            detalles_comision: comisiones,
-            transaction: {
-                id: transactionIdShort,
-                folio: folioUnico,
-                type: "Retiro (Cash-Out)",
-                agent_name: realAgentName,   
-                client_name: clientName,     
-                client_phone: clientPhone,   
-                amount: withdrawAmount,
-                commission: comisiones.comisionTotal,
-                created_at: new Date()
-            }
+      success: true,
+      new_balance: newBalance,
+      detalles_comision: comisiones,
+      transaction: {
+        id: transactionIdShort,
+        folio: folioUnico,
+        type: "Retiro (Cash-Out)",
+        agent_name: realAgentName,   
+        client_name: clientName,     
+        client_phone: clientPhone,   
+        amount: withdrawAmount,
+        commission: comisiones.comisionTotal,
+        created_at: new Date()
+      }
     });
   } catch (error) {
     console.error("ERROR EN CASH-OUT:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
-});
+}); 
 
 // Ruta para validar un código o QR de retiro
 app.post('/api/cash-out/validate-code', async (req, res) => {
@@ -1928,7 +1940,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
 }); 
 
 // ==========================================
-// 1. RETIRO EN PUNTO AGENTE (Enfocado en Comercios Pequeños)
+// 1. RETIRO EN PUNTO AGENTE (Enfocado en Comercios Pequeños Tier 1)
 // ==========================================
 app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
     const merchantId = req.user.id;
@@ -1943,7 +1955,7 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. Obtener datos del comercio y su tipo (tier)
+        // 1. Obtener datos del comercio usando únicamente 'tier'
         const merchantRes = await client.query(
             'SELECT id, balance, tier FROM users WHERE id = $1 FOR UPDATE',
             [merchantId]
@@ -1955,11 +1967,9 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
         }
 
         const merchant = merchantRes.rows[0];
-        
-        // Validamos directamente usando el tier (1 para pequeño, 2 para grande)
         const merchantTier = Number(merchant.tier || 1);
 
-        // 🛑 Si es Tier 2 (comercio grande), lo mandamos a liquidación ACH
+        // 🛑 Comercios Tier 2 (grandes) se canalizan a liquidación bancaria ACH
         if (merchantTier === 2) {
             await client.query('ROLLBACK');
             return res.status(403).json({ 
@@ -1968,7 +1978,7 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
             });
         }
 
-        // 🛡️ Límite por retiro individual para no desbancar a los puntos agentes locales
+        // 🛡️ Límite por retiro individual en punto agente local
         const MAX_RETIRO_AGENTE = 2500.00;
         if (withdrawAmount > MAX_RETIRO_AGENTE) {
             await client.query('ROLLBACK');
@@ -1992,7 +2002,7 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
         const withdrawalCode = Math.floor(100000 + Math.random() * 900000).toString();
         const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-        // 3. Registrar el código de retiro en la base de datos
+        // 3. Registrar el código de retiro sin comisiones (Monto íntegro)
         await client.query(
             `INSERT INTO withdrawal_codes (code, client_id, amount, status, expires_at) 
              VALUES ($1, $2, $3, 'PENDING', $4)`,
@@ -2019,7 +2029,7 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
 
 
 // ==========================================
-// 2. SOLICITUD DE TRANSFERENCIA BANCARIA (ACH) (Habilitado para Small y Large)
+// 2. SOLICITUD DE TRANSFERENCIA BANCARIA (ACH) (Comercios Tier 1 y Tier 2)
 // ==========================================
 app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
     const merchantId = req.user.id;
@@ -2038,9 +2048,9 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. Obtener datos y tipo del comercio
+        // 1. Obtener datos del comercio usando 'tier' y 'full_name'
         const merchantRes = await client.query(
-            'SELECT id, balance, merchant_type, tier, full_name FROM users WHERE id = $1 FOR UPDATE',
+            'SELECT id, balance, tier, full_name FROM users WHERE id = $1 FOR UPDATE',
             [merchantId]
         );
 
@@ -2050,11 +2060,11 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
         }
 
         const merchant = merchantRes.rows[0];
-        const merchantType = (merchant.merchant_type || merchant.tier || 'small').toLowerCase();
+        const merchantTier = Number(merchant.tier || 1);
 
-        // 🛡️ Regla de negocio: Monto mínimo para liquidación bancaria según el tipo
-        const MINIMO_ACH_SMALL = 500.00; // Comercios pequeños a partir de Q500
-        if ((merchantType === 'small' || merchantType === 'pequeno') && withdrawAmount < MINIMO_ACH_SMALL) {
+        // 🛡️ Regla de negocio: Monto mínimo para ACH en Comercios Pequeños (Tier 1)
+        const MINIMO_ACH_SMALL = 500.00;
+        if (merchantTier === 1 && withdrawAmount < MINIMO_ACH_SMALL) {
             await client.query('ROLLBACK');
             return res.status(400).json({
                 success: false,
@@ -2072,21 +2082,21 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
             });
         }
 
-        // 2. Descontar el saldo al comercio de inmediato mientras se procesa la transferencia
+        // 2. Descontar ÚNICAMENTE el monto exacto del retiro (Sin comisión)
         await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [withdrawAmount, merchantId]);
 
-        // 3. Registrar la transacción pendiente de procesamiento ACH
+        // 3. Registrar la transacción pendiente ACH
         const folioUnico = `ACH-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
-        const txResult = await client.query(
+        await client.query(
             `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at) 
-             VALUES ($1, $2, $3, $4, 'BANK-WITHDRAWAL-PENDING', NOW()) RETURNING id, created_at`,
+             VALUES ($1, $2, $3, $4, 'BANK-WITHDRAWAL-PENDING', NOW())`,
             [merchantId, merchantId, merchantId, withdrawAmount]
         );
 
         await client.query('COMMIT');
 
-        console.log(`📌 NUEVO RETIRO BANCARIO PENDIENTE (${merchantType.toUpperCase()}): ${merchant.full_name} solicita Q${withdrawAmount} a ${bank_name} No. ${account_number}`);
+        console.log(`📌 NUEVO RETIRO BANCARIO PENDIENTE (TIER ${merchantTier}): ${merchant.full_name} solicita Q${withdrawAmount} a ${bank_name} No. ${account_number}`);
 
         return res.json({
             success: true,
