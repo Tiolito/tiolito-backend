@@ -2011,9 +2011,9 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
 
         // 🌟 4. REGISTRAR LA TRANSACCIÓN EN LA TABLA TRANSACTIONS PARA EL HISTORIAL
         await client.query(
-            `INSERT INTO transactions (client_id, merchant_id, amount, type, created_at) 
-             VALUES ($1, $2, $3, 'AGENT-WITHDRAWAL-PENDING', NOW())`,
-            [merchantId, merchantId, withdrawAmount]
+            `INSERT INTO transactions (client_id, amount, type, created_at) 
+             VALUES ($1, $2, 'AGENT-WITHDRAWAL-PENDING', NOW())`,
+            [merchantId, withdrawAmount]
         );
 
         await client.query('COMMIT');
@@ -2092,13 +2092,13 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
         // 2. Descontar ÚNICAMENTE el monto exacto del retiro (Sin comisión)
         await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [withdrawAmount, merchantId]);
 
-        // 3. Registrar la transacción en la tabla transactions para el historial
+        // 3. Registrar la transacción en la tabla transactions para el historial (CORREGIDO)
         const folioUnico = `ACH-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         await client.query(
-            `INSERT INTO transactions (client_id, merchant_id, amount, type, created_at) 
-             VALUES ($1, $2, $3, 'BANK-WITHDRAWAL-PENDING', NOW())`,
-            [merchantId, merchantId, withdrawAmount]
+            `INSERT INTO transactions (client_id, amount, type, created_at) 
+             VALUES ($1, $2, 'BANK-WITHDRAWAL-PENDING', NOW())`,
+            [merchantId, withdrawAmount]
         );
 
         await client.query('COMMIT');
