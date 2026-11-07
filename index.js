@@ -2002,11 +2002,18 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
         const withdrawalCode = Math.floor(100000 + Math.random() * 900000).toString();
         const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-        // 3. Registrar el código de retiro sin comisiones (Monto íntegro)
+        // 3. Registrar el código de retiro en withdrawal_codes
         await client.query(
             `INSERT INTO withdrawal_codes (code, client_id, amount, status, expires_at) 
              VALUES ($1, $2, $3, 'PENDING', $4)`,
             [withdrawalCode, merchantId, withdrawAmount, expiresAt]
+        );
+
+        // 🌟 4. REGISTRAR LA TRANSACCIÓN EN LA TABLA TRANSACTIONS PARA EL HISTORIAL
+        await client.query(
+            `INSERT INTO transactions (client_id, merchant_id, amount, type, created_at) 
+             VALUES ($1, $2, $3, 'AGENT-WITHDRAWAL-PENDING', NOW())`,
+            [merchantId, merchantId, withdrawAmount]
         );
 
         await client.query('COMMIT');
@@ -2085,13 +2092,13 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
         // 2. Descontar ÚNICAMENTE el monto exacto del retiro (Sin comisión)
         await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [withdrawAmount, merchantId]);
 
-        // 3. Registrar la transacción pendiente ACH
+        // 3. Registrar la transacción en la tabla transactions para el historial
         const folioUnico = `ACH-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         await client.query(
-            `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at) 
-             VALUES ($1, $2, $3, $4, 'BANK-WITHDRAWAL-PENDING', NOW())`,
-            [merchantId, merchantId, merchantId, withdrawAmount]
+            `INSERT INTO transactions (client_id, merchant_id, amount, type, created_at) 
+             VALUES ($1, $2, $3, 'BANK-WITHDRAWAL-PENDING', NOW())`,
+            [merchantId, merchantId, withdrawAmount]
         );
 
         await client.query('COMMIT');
