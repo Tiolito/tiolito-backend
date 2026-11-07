@@ -1943,9 +1943,9 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. Obtener datos del comercio y su tipo (tier/merchant_type)
+        // 1. Obtener datos del comercio y su tipo (tier)
         const merchantRes = await client.query(
-            'SELECT id, balance, merchant_type, tier FROM users WHERE id = $1 FOR UPDATE',
+            'SELECT id, balance, tier FROM users WHERE id = $1 FOR UPDATE',
             [merchantId]
         );
 
@@ -1955,10 +1955,12 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
         }
 
         const merchant = merchantRes.rows[0];
-        const merchantType = (merchant.merchant_type || merchant.tier || 'small').toLowerCase();
+        
+        // Validamos directamente usando el tier (1 para pequeño, 2 para grande)
+        const merchantTier = Number(merchant.tier || 1);
 
-        // 🛑 Comercios grandes deben canalizarse a transferencias bancarias por volumen de caja
-        if (merchantType === 'large' || merchantType === 'grande') {
+        // 🛑 Si es Tier 2 (comercio grande), lo mandamos a liquidación ACH
+        if (merchantTier === 2) {
             await client.query('ROLLBACK');
             return res.status(403).json({ 
                 success: false, 
