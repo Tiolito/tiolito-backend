@@ -2200,6 +2200,42 @@ app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) =>
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// ==========================================
+// Endpoint para que el Admin vea el Historial de Pagos ACH Completados
+// ==========================================
+app.get('/api/admin/bank-withdrawals-history', verifyToken, async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                t.id, 
+                t.amount, 
+                t.type,
+                t.created_at, 
+                t.bank_name,
+                t.account_number,
+                t.account_type,
+                COALESCE(u.full_name, 'Comercio') AS merchant_name,
+                COALESCE(u.phone_number, 'N/A') AS merchant_phone
+            FROM transactions t
+            LEFT JOIN users u ON t.merchant_id::text = u.id::text OR t.client_id::text = u.id::text
+            WHERE UPPER(t.type) = 'BANK-WITHDRAWAL-COMPLETED'
+            ORDER BY t.created_at DESC
+            LIMIT 50
+        `;
+
+        const result = await pool.query(query);
+
+        res.json({ 
+            success: true, 
+            history: result.rows 
+        });
+
+    } catch (error) {
+        console.error("Error al obtener historial ACH:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
