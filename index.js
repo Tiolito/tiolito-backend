@@ -1728,7 +1728,7 @@ app.get('/api/merchant/daily-report', async (req, res) => {
 });
 
 // ==========================================
-// 3. Historial de ventas detallado del comercio
+// 3. Historial detallado del comercio (Ventas y Retiros)
 // ==========================================
 app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
     try {
@@ -1746,8 +1746,14 @@ app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
             FROM transactions t
             LEFT JOIN users u ON t.client_id::text = u.id::text
             LEFT JOIN users m ON t.merchant_id::text = m.id::text OR t.agent_id::text = m.id::text
-            WHERE (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text) 
-              AND UPPER(t.type) IN ('MERCHANT-PAYMENT', 'REFUND', 'MERCHANT_PAYMENT')
+            WHERE (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text OR t.client_id::text = $1::text) 
+              AND UPPER(t.type) IN (
+                  'MERCHANT-PAYMENT', 
+                  'REFUND', 
+                  'MERCHANT_PAYMENT', 
+                  'AGENT-WITHDRAWAL-PENDING', 
+                  'BANK-WITHDRAWAL-PENDING'
+              )
             ORDER BY t.created_at DESC 
             LIMIT 50   
         `;
@@ -1760,7 +1766,7 @@ app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Error al cargar ventas detalladas del comercio:", error);
+        console.error("Error al cargar transacciones detalladas del comercio:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
