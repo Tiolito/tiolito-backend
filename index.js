@@ -2102,9 +2102,9 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
         const folioUnico = `ACH-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         await client.query(
-            `INSERT INTO transactions (client_id, amount, type, created_at) 
-             VALUES ($1, $2, 'BANK-WITHDRAWAL-PENDING', NOW())`,
-            [merchantId, withdrawAmount]
+            `INSERT INTO transactions (client_id, amount, type, bank_name, account_number, account_type, created_at) 
+             VALUES ($1, $2, 'BANK-WITHDRAWAL-PENDING', $3, $4, $5, NOW())`,
+            [merchantId, withdrawAmount, bank_name, account_number, account_type || 'Monetaria']
         );
 
         await client.query('COMMIT');
