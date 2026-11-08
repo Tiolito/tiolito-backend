@@ -2137,17 +2137,16 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
 // ==========================================
 app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
     try {
-        // Opcional: Validar si el usuario es administrador
         const query = `
             SELECT 
                 t.id, 
                 t.amount, 
                 t.type,
                 t.created_at, 
-                u.full_name AS merchant_name,
-                u.phone_number AS merchant_phone
+                COALESCE(u.full_name, 'Comercio') AS merchant_name,
+                COALESCE(u.phone_number, 'N/A') AS merchant_phone
             FROM transactions t
-            JOIN users u ON t.merchant_id::text = u.id::text
+            LEFT JOIN users u ON t.merchant_id::text = u.id::text OR t.client_id::text = u.id::text
             WHERE UPPER(t.type) = 'BANK-WITHDRAWAL-PENDING'
             ORDER BY t.created_at DESC
         `;
@@ -2163,7 +2162,7 @@ app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
         console.error("Error al obtener solicitudes ACH:", error);
         res.status(500).json({ success: false, error: error.message });
     }
-}); 
+});
 
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
