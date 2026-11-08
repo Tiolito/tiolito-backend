@@ -2132,6 +2132,39 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
     }
 });
 
+// ==========================================
+// Endpoint para que el Admin vea las solicitudes ACH pendientes
+// ==========================================
+app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
+    try {
+        // Opcional: Validar si el usuario es administrador
+        const query = `
+            SELECT 
+                t.id, 
+                t.amount, 
+                t.type,
+                t.created_at, 
+                u.full_name AS merchant_name,
+                u.phone_number AS merchant_phone
+            FROM transactions t
+            JOIN users u ON t.merchant_id::text = u.id::text
+            WHERE UPPER(t.type) = 'BANK-WITHDRAWAL-PENDING'
+            ORDER BY t.created_at DESC
+        `;
+
+        const result = await pool.query(query);
+
+        res.json({ 
+            success: true, 
+            withdrawals: result.rows 
+        });
+
+    } catch (error) {
+        console.error("Error al obtener solicitudes ACH:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}); 
+
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 
