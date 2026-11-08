@@ -2143,6 +2143,9 @@ app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
                 t.amount, 
                 t.type,
                 t.created_at, 
+                t.bank_name,
+                t.account_number,
+                t.account_type,
                 COALESCE(u.full_name, 'Comercio') AS merchant_name,
                 COALESCE(u.phone_number, 'N/A') AS merchant_phone
             FROM transactions t
