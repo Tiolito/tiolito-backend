@@ -2164,6 +2164,40 @@ app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
     }
 });
 
+// ==========================================
+// Endpoint para que el Admin marque una liquidación ACH como completada
+// ==========================================
+app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) => {
+    const { transaction_id } = req.body;
+
+    if (!transaction_id) {
+        return res.status(400).json({ success: false, error: 'ID de transacción requerido.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `UPDATE transactions 
+             SET type = 'BANK-WITHDRAWAL-COMPLETED' 
+             WHERE id = $1 AND UPPER(type) = 'BANK-WITHDRAWAL-PENDING' 
+             RETURNING id`,
+            [transaction_id]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'Transacción no encontrada o ya procesada.' });
+        }
+
+        res.json({ 
+            success: true, 
+            message: 'Liquidación marcada como completada con éxito.' 
+        });
+
+    } catch (error) {
+        console.error("Error al completar liquidación ACH:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+ 
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 
