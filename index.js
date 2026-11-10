@@ -2275,6 +2275,85 @@ app.get('/api/admin/balance', verifyToken, async (req, res) => {
         return res.status(500).json({ success: false, error: 'Error al consultar el balance general.' });
     }
 });
+
+// ==========================================
+// ENDPOINT: POST /api/agent/withdraw-bank (Exclusivo para Agentes)
+// ==========================================
+app.post('/api/agent/withdraw-bank', verifyToken, async (req, res) => {
+    const userId = req.user.id;
+    const { amount, bank_name, account_number, account_type } = req.body;
+
+    const withdrawAmount = parseFloat(amount);
+    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
+        return res.status(400).json({ success: false, error: 'Monto de retiro inválido.' });
+    }
+
+    if (!bank_name || !account_number) {
+        return res.status(400).json({ success: false, error: 'Proporciona el banco y el número de cuenta de destino.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Verificar que el usuario exista y sea Agente (Validación estricta de rol)
+        const userRes = await client.query(
+            'SELECT id, balance, role, full_name FROM users WHERE id::text = $1::text FOR UPDATE',
+            [String(userId)]
+        );
+
+        if (userRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Agente no encontrado.' });
+        }
+
+        const userData = userRes.rows[0];
+        
+        // Opcional: Validar que el rol sea agente (si usas 'AGENT' o 'PUNTO-AGENTE')
+        // if (userData.role !== 'AGENT' && userData.role !== 'PUNTO-AGENTE') { ... }
+
+        const currentBalance = parseFloat(userData.balance || 0);
+
+        if (currentBalance < withdrawAmount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente. Tu saldo disponible como agente es de Q${currentBalance.toFixed(2)}.`
+            });
+        }
+
+        // 2. Descontar el saldo del agente
+        await client.query('UPDATE users SET balance = balance - $1 WHERE id::text = $2::text', [withdrawAmount, String(userId)]);
+        try {
+            await client.query('UPDATE wallets SET balance = balance - $1 WHERE user_id::text = $2::text', [withdrawAmount, String(userId)]);
+        } catch (eWallet) {}
+
+        // 3. Registrar la transacción con un tipo específico para el panel de administración
+        const folioUnico = `ACH-AGT-${Date.now().toString().slice(-6)}`;
+
+        await client.query(
+            `INSERT INTO transactions (client_id, agent_id, amount, type, bank_name, account_number, account_type, created_at) 
+             VALUES ($1, $1, $2, 'AGENT-BANK-WITHDRAWAL-PENDING', $3, $4, $5, NOW())`,
+            [String(userId), withdrawAmount, bank_name, account_number, account_type || 'Monetaria']
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            folio: folioUnico,
+            amount: withdrawAmount,
+            message: 'Solicitud de retiro bancario enviada con éxito. El administrador procesará tu transferencia.'
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error en retiro de agente:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    } finally {
+        client.release();
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
