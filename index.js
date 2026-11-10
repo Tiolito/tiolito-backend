@@ -1817,7 +1817,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         const merchantName = merchantData.full_name || 'Comercio Local';
         
         // Detectar tipo de comercio (soporta 'merchant_type' o 'tier')
-        const merchantType = (merchantData.tier || merchantData.merchant_type || 'small').toLowerCase();
+        const merchantType = (merchantData.merchant_type || merchantData.tier || 'small').toLowerCase();
 
         // 🛡️ 3. APLICAR LÍMITES SEGÚN EL TIPO DE COMERCIO
         let limiteMaxPerTx = 2500.00;
@@ -1942,7 +1942,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     } finally {
         client.release();
     }
-}); 
+});
 
 // ==========================================
 // 1. RETIRO EN PUNTO AGENTE (Enfocado en Comercios Pequeños Tier 1)
