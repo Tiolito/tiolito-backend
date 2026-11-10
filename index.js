@@ -1909,7 +1909,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         delete activeCharges[charge_code];
 
         const receiptPayload = {
-            folio: folioUnico,
+            folio: `TRX-${txResult.rows[0].id}`,
             id: txResult.rows[0].id,
             type: 'Pago a Comercio',
             sender_name: clientData.full_name,
