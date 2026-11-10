@@ -1826,10 +1826,10 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         let limiteMaxDaily = 10000.00;
         let tasaComision = 0.020; // 2.0% por defecto para pequeños
 
-        if (merchantType === 'large' || merchantType === 'grande') {
-            limiteMaxPerTx = 10000.00; // Límite mayor para grandes
+        if (isLargeMerchant) {
+            limiteMaxPerTx = 10000.00; // Límite mayor para grandes (Tier 2)
             limiteMaxDaily = 50000.00; // Límite diario mayor para grandes
-            tasaComision = 0.025;      // 2.5% estándar para grandes
+            tasaComision = 0.025;      // 2.5% estándar para grandes (Tier 2)
         }
 
         // Validar límite por transacción individual
