@@ -2236,6 +2236,42 @@ app.get('/api/admin/bank-withdrawals-history', verifyToken, async (req, res) => 
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// ==========================================
+// ENDPOINT: GET /api/admin/balance (Obtener saldo del Administrador)
+// ==========================================
+app.get('/api/admin/balance', verifyToken, async (req, res) => {
+    // Opcional: Validar que el usuario que hace la petición realmente sea 'admin'
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, error: 'Acceso denegado. Se requiere rol de administrador.' });
+    }
+
+    const adminId = req.user.id; // Obtenido del token verificado
+
+    try {
+        // 1. Consultar el balance directamente del usuario admin autenticado
+        const adminRes = await pool.query(
+            "SELECT id, full_name, balance FROM users WHERE id = $1", 
+            [adminId]
+        );
+
+        if (adminRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Cuenta de administrador no encontrada.' });
+        }
+
+        const adminData = adminRes.rows[0];
+        const adminBalance = parseFloat(adminData.balance || 0).toFixed(2);
+
+        return res.json({
+            success: true,
+            balance: adminBalance
+        });
+
+    } catch (error) {
+        console.error("Error al obtener el balance del admin:", error);
+        return res.status(500).json({ success: false, error: 'Error al consultar el balance general.' });
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
