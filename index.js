@@ -1772,7 +1772,7 @@ app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// ENDPOINT: POST /api/client/pay-merchant (Pago a comercio con Dos Tipos de Comercio y Límites)
+// ENDPOINT: POST /api/client/pay-merchant (Corregido para evitar conflicto de tipos)
 // ==========================================
 app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     const clientId = req.user.id;
@@ -1802,11 +1802,10 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 2. Obtener datos y tipo del comercio receptor desde la base de datos
-        // Verificamos si tiene definido un merchant_type o tier ('small' o 'large'). Por defecto será 'small'.
+        // 2. Obtener datos y tipo del comercio receptor (Forzando conversión segura a texto con ::text)
         const merchantRes = await client.query(
-            'SELECT id, full_name, merchant_type, tier FROM users WHERE id = $1', 
-            [merchantUserId]
+            'SELECT id, full_name, merchant_type, tier FROM users WHERE id::text = $1::text', 
+            [String(merchantUserId)]
         );
 
         if (merchantRes.rows.length === 0) {
@@ -1840,11 +1839,11 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             });
         }
 
-        // Consultar acumulado diario del comercio en transacciones de hoy
+        // Consultar acumulado diario del comercio en transacciones de hoy (Convertido a texto para evitar errores)
         const ventasHoyRes = await client.query(
             `SELECT COALESCE(SUM(amount), 0) AS total_hoy FROM transactions 
-             WHERE (merchant_id = $1 OR agent_id = $1) AND created_at::date = CURRENT_DATE`,
-            [merchantUserId]
+             WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) AND created_at::date = CURRENT_DATE`,
+            [String(merchantUserId)]
         );
         const totalVentasHoy = parseFloat(ventasHoyRes.rows[0].total_hoy || 0);
 
@@ -1856,8 +1855,8 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             });
         }
 
-        // 4. Obtener datos del cliente pagador
-        const clientCheck = await client.query('SELECT id, full_name, phone_number, balance FROM users WHERE id = $1 FOR UPDATE', [clientId]);
+        // 4. Obtener datos del cliente pagador (Convertido a texto de forma segura)
+        const clientCheck = await client.query('SELECT id, full_name, phone_number, balance FROM users WHERE id::text = $1::text FOR UPDATE', [String(clientId)]);
         if (clientCheck.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
@@ -1870,17 +1869,17 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             return res.status(400).json({ success: false, error: `Saldo insuficiente. Tienes Q${clientBalance} y necesitas Q${amountToPay}.` });
         }
 
-        // 🚀 5. CÁLCULO DINÁMICO DE COMISIONES (2.0% pequeños / 2.5% grandes)
+        // 🚀 5. CÁLCULO DINÁMICO DE COMISIONES
         const comisionTiolito = Number((amountToPay * tasaComision).toFixed(2));
         const montoNetoComercio = Number((amountToPay - comisionTiolito).toFixed(2));
 
         // 6. Descontar el monto total al cliente
-        await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amountToPay, clientId]);
+        await client.query('UPDATE users SET balance = balance - $1 WHERE id::text = $2::text', [amountToPay, String(clientId)]);
 
         // 7. Acreditar el monto NETO al comercio
-        await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [montoNetoComercio, merchantUserId]);
+        await client.query('UPDATE users SET balance = balance + $1 WHERE id::text = $2::text', [montoNetoComercio, String(merchantUserId)]);
         try {
-            await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2', [montoNetoComercio, merchantUserId]);
+            await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id::text = $2::text', [montoNetoComercio, String(merchantUserId)]);
         } catch (eWallet) {}
 
         // 8. Acreditar el 100% de la comisión a Tiolito Admin automáticamente
@@ -1889,9 +1888,9 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         );
         if (adminRes.rows.length > 0) {
             const adminId = adminRes.rows[0].id;
-            await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [comisionTiolito, adminId]);
+            await client.query('UPDATE users SET balance = balance + $1 WHERE id::text = $2::text', [comisionTiolito, String(adminId)]);
             try {
-                await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2', [comisionTiolito, adminId]);
+                await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id::text = $2::text', [comisionTiolito, String(adminId)]);
             } catch (eWalletAdmin) {}
         }
 
@@ -1943,7 +1942,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     } finally {
         client.release();
     }
-}); 
+});
 
 // ==========================================
 // 1. RETIRO EN PUNTO AGENTE (Enfocado en Comercios Pequeños Tier 1)
