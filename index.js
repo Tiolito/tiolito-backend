@@ -2136,7 +2136,7 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// Endpoint para que el Admin vea las solicitudes ACH pendientes
+// Endpoint para que el Admin vea las solicitudes ACH pendientes (Comercios y Agentes)
 // ==========================================
 app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
     try {
@@ -2149,11 +2149,12 @@ app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
                 t.bank_name,
                 t.account_number,
                 t.account_type,
-                COALESCE(u.full_name, 'Comercio') AS merchant_name,
-                COALESCE(u.phone_number, 'N/A') AS merchant_phone
+                COALESCE(u.full_name, 'Usuario') AS merchant_name,
+                COALESCE(u.phone_number, 'N/A') AS merchant_phone,
+                u.role AS user_role
             FROM transactions t
             LEFT JOIN users u ON t.merchant_id::text = u.id::text OR t.client_id::text = u.id::text
-            WHERE UPPER(t.type) = 'BANK-WITHDRAWAL-PENDING'
+            WHERE UPPER(t.type) IN ('BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING')
             ORDER BY t.created_at DESC
         `;
 
