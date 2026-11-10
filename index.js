@@ -1816,20 +1816,18 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         const merchantData = merchantRes.rows[0];
         const merchantName = merchantData.full_name || 'Comercio Local';
         
-        const rawTier = String(merchantData.tier || '').trim();
-        const rawType = String(merchantData.merchant_type || '').toLowerCase();
-
-        const isLargeMerchant = rawTier === '2' || rawType === 'large' || rawType === 'grande';
+        // Detectar tipo de comercio (soporta 'merchant_type' o 'tier')
+        const merchantType = (merchantData.tier || merchantData.merchant_type || 'small').toLowerCase();
 
         // 🛡️ 3. APLICAR LÍMITES SEGÚN EL TIPO DE COMERCIO
         let limiteMaxPerTx = 2500.00;
         let limiteMaxDaily = 10000.00;
         let tasaComision = 0.020; // 2.0% por defecto para pequeños
 
-        if (isLargeMerchant) {
-            limiteMaxPerTx = 10000.00; // Límite mayor para grandes (Tier 2)
+        if (merchantType === 'large' || merchantType === 'grande') {
+            limiteMaxPerTx = 10000.00; // Límite mayor para grandes
             limiteMaxDaily = 50000.00; // Límite diario mayor para grandes
-            tasaComision = 0.025;      // 2.5% estándar para grandes (Tier 2)
+            tasaComision = 0.025;      // 2.5% estándar para grandes
         }
 
         // Validar límite por transacción individual
