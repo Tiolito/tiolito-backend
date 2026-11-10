@@ -1684,36 +1684,40 @@ app.post('/api/merchant/generate-charge', verifyToken, async (req, res) => {
     }
 });
 
-app.get('/api/merchant/daily-report', async (req, res) => {
+// ==========================================
+// ENDPOINT: GET /api/merchant/daily-report (Corregido para UUID y Auth por Token)
+// ==========================================
+app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
   try {
-    const { merchantId } = req.query;
-    
-    // 💡 Convertimos el merchantId a número entero por seguridad
-    const numericMerchantId = parseInt(merchantId, 10);
+    const merchantId = req.user.id; // Obtenemos el ID directamente del token JWT de manera segura
 
-    if (isNaN(numericMerchantId)) {
-      return res.status(400).json({ success: false, message: "ID de comercio inválido" });
+    if (!merchantId) {
+      return res.status(400).json({ success: false, message: "ID de comercio no encontrado en el token" });
     }
 
+    // Consulta de resumen diario utilizando conversión estricta ::text para UUIDs
     const summaryQuery = `
       SELECT 
         COALESCE(SUM(amount), 0) as total_sales, 
         COUNT(*) as total_transactions
       FROM transactions 
-      WHERE merchant_id = $1 
+      WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) 
+      AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
       AND DATE(created_at) = CURRENT_DATE;
     `;
-    const summaryRes = await pool.query(summaryQuery, [numericMerchantId]);
+    const summaryRes = await pool.query(summaryQuery, [String(merchantId)]);
 
+    // Consulta detallada de transacciones del día para el comercio
     const txQuery = `
       SELECT t.*, u.full_name as client_name 
       FROM transactions t
-      LEFT JOIN users u ON t.client_id = u.id
-      WHERE t.merchant_id = $1 
+      LEFT JOIN users u ON t.client_id::text = u.id::text
+      WHERE (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text) 
+      AND UPPER(t.type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
       AND DATE(t.created_at) = CURRENT_DATE
       ORDER BY t.created_at DESC;
     `;
-    const txRes = await pool.query(txQuery, [numericMerchantId]);
+    const txRes = await pool.query(txQuery, [String(merchantId)]);
 
     res.json({
       success: true,
