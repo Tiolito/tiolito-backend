@@ -2172,7 +2172,7 @@ app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// Endpoint para que el Admin marque una liquidación ACH como completada
+// Endpoint para que el Admin marque una liquidación ACH como completada (Comercios y Agentes)
 // ==========================================
 app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) => {
     const { transaction_id } = req.body;
@@ -2182,10 +2182,11 @@ app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) =>
     }
 
     try {
+        // Actualizamos a 'BANK-WITHDRAWAL-COMPLETED' sin importar si vino de un comercio o de un agente
         const result = await pool.query(
             `UPDATE transactions 
              SET type = 'BANK-WITHDRAWAL-COMPLETED' 
-             WHERE id = $1 AND UPPER(type) = 'BANK-WITHDRAWAL-PENDING' 
+             WHERE id = $1 AND UPPER(type) IN ('BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING') 
              RETURNING id`,
             [transaction_id]
         );
@@ -2206,7 +2207,7 @@ app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) =>
 });
 
 // ==========================================
-// Endpoint para que el Admin vea el Historial de Pagos ACH Completados
+// Endpoint para que el Admin vea el Historial de Pagos ACH Completados (Comercios y Agentes)
 // ==========================================
 app.get('/api/admin/bank-withdrawals-history', verifyToken, async (req, res) => {
     try {
@@ -2219,8 +2220,9 @@ app.get('/api/admin/bank-withdrawals-history', verifyToken, async (req, res) => 
                 t.bank_name,
                 t.account_number,
                 t.account_type,
-                COALESCE(u.full_name, 'Comercio') AS merchant_name,
-                COALESCE(u.phone_number, 'N/A') AS merchant_phone
+                COALESCE(u.full_name, 'Usuario') AS merchant_name,
+                COALESCE(u.phone_number, 'N/A') AS merchant_phone,
+                u.role AS user_role
             FROM transactions t
             LEFT JOIN users u ON t.merchant_id::text = u.id::text OR t.client_id::text = u.id::text
             WHERE UPPER(t.type) = 'BANK-WITHDRAWAL-COMPLETED'
