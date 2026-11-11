@@ -2357,6 +2357,38 @@ app.post('/api/agent/withdraw-bank', verifyToken, async (req, res) => {
         client.release();
     }
 });
+
+// ==========================================
+// Endpoint para que el Comercio o Agente vea el estatus de sus retiros ACH
+// ==========================================
+app.get('/api/user/withdrawals', verifyToken, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        const query = `
+            SELECT id, amount, type, bank_name, account_number, account_type, created_at
+            FROM transactions
+            WHERE (client_id::text = $1::text OR merchant_id::text = $1::text)
+            AND UPPER(type) IN (
+                'BANK-WITHDRAWAL-PENDING', 
+                'AGENT-BANK-WITHDRAWAL-PENDING', 
+                'BANK-WITHDRAWAL-COMPLETED'
+            )
+            ORDER BY created_at DESC
+            LIMIT 20
+        `;
+
+        const result = await pool.query(query, [String(userId)]);
+
+        res.json({
+            success: true,
+            withdrawals: result.rows
+        });
+    } catch (error) {
+        console.error("Error al obtener retiros del usuario:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
