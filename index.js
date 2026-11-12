@@ -2368,7 +2368,7 @@ app.get('/api/user/withdrawals', verifyToken, async (req, res) => {
         const query = `
             SELECT id, amount, type, bank_name, account_number, account_type, created_at
             FROM transactions
-            WHERE (client_id::text = $1::text OR merchant_id::text = $1::text)
+            WHERE (client_id::text = $1::text OR merchant_id::text = $1::text OR agent_id::text = $1::text)
             AND UPPER(type) IN (
                 'BANK-WITHDRAWAL-PENDING', 
                 'AGENT-BANK-WITHDRAWAL-PENDING', 
