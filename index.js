@@ -722,6 +722,7 @@ app.post('/api/agent/deposit', verifyToken, async (req, res) => {
     }
 });
 
+// ==========================================
 // ENDPOINT: GET /api/agent/transactions (Historial de transacciones del agente)
 // ==========================================
 app.get('/api/agent/transactions', verifyToken, async (req, res) => {
@@ -742,15 +743,19 @@ app.get('/api/agent/transactions', verifyToken, async (req, res) => {
         t.created_at,
         COALESCE(u.full_name, 'Cliente Genérico') AS client_name,
         COALESCE(u.phone_number, '') AS client_phone,
-        -- 👈 Aquí está la corrección: Busca el nombre en la tabla users y si no, usa el nombre del token (req.user.name) o 'Agente Autorizado'
         COALESCE(agent_user.full_name, $2, 'Agente Autorizado') AS agent_name
       FROM transactions t 
       LEFT JOIN users u ON t.client_id::text = u.id::text 
       LEFT JOIN users agent_user ON t.agent_id::text = agent_user.id::text
       WHERE t.agent_id::text = $1::text
+      -- 🌟 EXCLUIR LAS SOLICITUDES DE RETIRO ACH DEL HISTORIAL DE CAJA
+      AND UPPER(t.type) NOT IN (
+        'BANK-WITHDRAWAL-PENDING', 
+        'AGENT-BANK-WITHDRAWAL-PENDING', 
+        'BANK-WITHDRAWAL-COMPLETED'
+      )
     `;
     
-    // Pasamos el ID del agente y el nombre del usuario logueado desde el token como parámetros
     const queryParams = [String(agent_id), req.user?.name || 'Agente Autorizado'];
 
     if (search && search.trim() !== '') {
