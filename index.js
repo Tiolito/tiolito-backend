@@ -2408,8 +2408,8 @@ app.delete('/api/agent/withdrawals/:id', verifyToken, async (req, res) => {
             SELECT id, amount, type 
             FROM transactions 
             WHERE id = $1 
-            AND agent_id::text = $2::text 
-            AND UPPER(type) = 'AGENT-BANK-WITHDRAWAL-PENDING'
+            AND (agent_id::text = $2::text OR merchant_id::text = $2::text) 
+            AND UPPER(type) = ('AGENT-BANK-WITHDRAWAL-PENDING', 'BANK-WITHDRAWAL-PENDING')
         `;
         const checkResult = await pool.query(checkQuery, [withdrawalId, String(agent_id)]);
 
