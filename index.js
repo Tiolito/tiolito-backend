@@ -2394,6 +2394,48 @@ app.get('/api/user/withdrawals', verifyToken, async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// ==========================================
+// Endpoint para que el Agente cancele su solicitud ACH pendiente
+// ==========================================
+app.delete('/api/agent/withdrawals/:id', verifyToken, async (req, res) => {
+    const agent_id = req.user?.id || req.user?.userId;
+    const withdrawalId = req.params.id;
+
+    try {
+        // 1. Verificar que la transacción exista, pertenezca al agente y esté pendiente
+        const checkQuery = `
+            SELECT id, amount, type 
+            FROM transactions 
+            WHERE id = $1 
+            AND agent_id::text = $2::text 
+            AND UPPER(type) = 'AGENT-BANK-WITHDRAWAL-PENDING'
+        `;
+        const checkResult = await pool.query(checkQuery, [withdrawalId, String(agent_id)]);
+
+        if (checkResult.rowCount === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'No se encontró la solicitud o ya fue procesada/completada por el administrador.' 
+            });
+        }
+
+        // 2. Eliminar la solicitud (o cambiar su tipo a 'CANCELLED' si prefieres llevar historial)
+        // Aquí la eliminaremos para liberar la solicitud; puedes ajustar si prefieres hacer un UPDATE.
+        await pool.query(`DELETE FROM transactions WHERE id = $1`, [withdrawalId]);
+
+        // Opcional: Si al solicitar el retiro se le descontó el saldo al agente, aquí puedes devolvérselo con un UPDATE a su cuenta.
+
+        res.json({
+            success: true,
+            message: 'Solicitud de retiro ACH cancelada con éxito.'
+        });
+
+    } catch (error) {
+        console.error("Error al cancelar retiro ACH:", error);
+        res.status(500).json({ success: false, error: 'Error interno al cancelar la solicitud.' });
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
