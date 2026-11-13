@@ -2396,27 +2396,27 @@ app.get('/api/user/withdrawals', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// Endpoint para que el Agente cancele su solicitud ACH pendiente y recupere su saldo
+// Endpoint para cancelar solicitud de retiro (Comercios y Agentes)
 // ==========================================
-app.delete('/api/agent/withdrawals/:id', verifyToken, async (req, res) => {
-    const agent_id = req.user?.id || req.user?.userId;
+app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
+    const userId = req.user?.id || req.user?.userId;
     const withdrawalId = req.params.id;
 
     try {
-        // 1. Buscar la solicitud pendiente para saber el monto exacto antes de borrarla
+        // 1. Buscar la solicitud pendiente en la base de datos
         const checkQuery = `
             SELECT id, amount, type 
             FROM transactions 
             WHERE id = $1 
-            AND (agent_id::text = $2::text OR merchant_id::text = $2::text) 
-            AND UPPER(type) = ('AGENT-BANK-WITHDRAWAL-PENDING', 'BANK-WITHDRAWAL-PENDING')
+            AND (client_id::text = $2::text OR merchant_id::text = $2::text OR agent_id::text = $2::text)
+            AND UPPER(type) IN ('BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING')
         `;
-        const checkResult = await pool.query(checkQuery, [withdrawalId, String(agent_id)]);
+        const checkResult = await pool.query(checkQuery, [withdrawalId, String(userId)]);
 
         if (checkResult.rowCount === 0) {
             return res.status(404).json({ 
                 success: false, 
-                error: 'No se encontró la solicitud o ya fue procesada/completada por el administrador.' 
+                error: 'No se encontró la solicitud pendiente o ya fue procesada.' 
             });
         }
 
@@ -2425,19 +2425,19 @@ app.delete('/api/agent/withdrawals/:id', verifyToken, async (req, res) => {
         // 2. Eliminar la solicitud de la tabla transactions
         await pool.query(`DELETE FROM transactions WHERE id = $1`, [withdrawalId]);
 
-        // 3. 🌟 DEVOLVER EL SALDO AL AGENTE: Sumar el monto de vuelta a su balance en la tabla users
+        // 3. Devolver el saldo al usuario sumándoselo a su balance
         await pool.query(
             `UPDATE users SET balance = balance + $1 WHERE id::text = $2::text`,
-            [withdrawalAmount, String(agent_id)]
+            [withdrawalAmount, String(userId)]
         );
 
         res.json({
             success: true,
-            message: 'Solicitud cancelada y saldo devuelto a tu cuenta con éxito.'
+            message: 'Solicitud cancelada y saldo devuelto con éxito.'
         });
 
     } catch (error) {
-        console.error("Error al cancelar retiro ACH:", error);
+        console.error("Error al cancelar retiro:", error);
         res.status(500).json({ success: false, error: 'Error interno al cancelar la solicitud.' });
     }
 });
