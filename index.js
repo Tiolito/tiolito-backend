@@ -2441,10 +2441,176 @@ app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
         res.status(500).json({ success: false, error: 'Error interno al cancelar la solicitud.' });
     }
 });
+
+// ==========================================
+// 1. REGISTRO CON ENVÍO DE CÓDIGO DE VERIFICACIÓN
+// ==========================================
+app.post('/api/register', async (req, res) => {
+  const { phone_number, pin, full_name, role } = req.body;
+
+  if (!phone_number || !pin) {
+    return res.status(400).json({ success: false, error: "Teléfono y PIN son obligatorios" });
+  }
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    const pin_hash = await bcrypt.hash(pin, salt); 
+    const userRole = 'CLIENT';
+
+    // Generar código aleatorio de 6 dígitos
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    const result = await pool.query(
+      `INSERT INTO users (phone_number, pin_hash, full_name, role, balance, is_verified, verification_code) 
+       VALUES ($1, $2, $3, $4, $5, FALSE, $6) 
+       RETURNING id, phone_number, role`,
+      [phone_number, pin_hash, full_name || 'Usuario', userRole, 0.00, verificationCode]
+    );
+
+    // 🌟 ZONA DE ENVÍO DE MENSAJE (MODO PRUEBA JSON / LISTO PARA TWILIO)
+    /* 
+      TODO PARA PRODUCCIÓN (TWILIO):
+      const twilio = require('twilio');
+      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      await client.messages.create({
+          body: `Tu código de verificación Tiolito es: ${verificationCode}`,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: `+502${phone_number}`
+      });
+    */
+
+    return res.json({
+      success: true,
+      requires_verification: true,
+      message: 'Cuenta registrada. Ingresa el código de verificación.',
+      dev_code: verificationCode // 👈 Esto te devuelve el código en el JSON para probar sin costo
+    });
+  } catch (error) {
+    console.error("ERROR EN EL REGISTRO:", error);
+    if (error.code === '23505') {
+      return res.status(400).json({ success: false, error: "El número ya está registrado" });
+    }
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==========================================
+// 2. VERIFICAR EL CÓDIGO DE REGISTRO
+// ==========================================
+app.post('/api/auth/verify-code', async (req, res) => {
+  const { phone_number, code } = req.body;
+
+  try {
+    const userRes = await pool.query(
+      'SELECT id, role, full_name FROM users WHERE phone_number = $1 AND verification_code = $2',
+      [phone_number, code]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'Código de verificación incorrecto o inválido.' });
+    }
+
+    const user = userRes.rows[0];
+
+    // Marcar como verificado y limpiar el código temporal
+    await pool.query(
+      'UPDATE users SET is_verified = TRUE, verification_code = NULL WHERE id = $1',
+      [user.id]
+    );
+
+    const token = jwt.sign({ id: user.id, role: user.role, name: user.full_name }, JWT_SECRET, { expiresIn: '2h' });
+
+    res.json({
+      success: true,
+      token,
+      role: user.role,
+      user_id: user.id,
+      name: user.full_name,
+      message: '¡Cuenta verificada con éxito!'
+    });
+  } catch (error) {
+    console.error("Error al verificar código:", error);
+    res.status(500).json({ success: false, error: 'Error interno del servidor.' });
+  }
+});
+
+// ==========================================
+// 3. SOLICITAR RECUPERACIÓN DE CONTRASEÑA
+// ==========================================
+app.post('/api/auth/forgot-password', async (req, res) => {
+    const { phone_number } = req.body;
+
+    try {
+        const userResult = await pool.query(`SELECT id FROM users WHERE phone_number = $1`, [phone_number]);
+        if (userResult.rowCount === 0) {
+            return res.status(404).json({ success: false, error: 'No se encontró una cuenta con este número.' });
+        }
+
+        const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+        await pool.query(
+            `UPDATE users SET reset_code = $1, reset_expires = NOW() + INTERVAL '15 minutes' WHERE phone_number = $2`,
+            [resetCode, phone_number]
+        );
+
+        /* 
+          TODO PARA PRODUCCIÓN (TWILIO):
+          await client.messages.create({
+              body: `Tu código para recuperar contraseña en Tiolito es: ${resetCode}`,
+              from: process.env.TWILIO_PHONE_NUMBER,
+              to: `+502${phone_number}`
+          });
+        */
+
+        res.json({
+            success: true,
+            message: 'Código de recuperación generado.',
+            dev_code: resetCode // 👈 Código en JSON para pruebas locales
+        });
+    } catch (error) {
+        console.error('Error en forgot-password:', error);
+        res.status(500).json({ success: false, error: 'Error interno del servidor.' });
+    }
+});
+
+// ==========================================
+// 4. RESTABLECER CONTRASEÑA CON CÓDIGO
+// ==========================================
+app.post('/api/auth/reset-password', async (req, res) => {
+    const { phone_number, code, new_password } = req.body;
+
+    if (!phone_number || !code || !new_password) {
+        return res.status(400).json({ success: false, error: 'Todos los campos son obligatorios.' });
+    }
+
+    try {
+        const checkResult = await pool.query(
+            `SELECT id FROM users WHERE phone_number = $1 AND reset_code = $2 AND reset_expires > NOW()`,
+            [phone_number, code]
+        );
+
+        if (checkResult.rowCount === 0) {
+            return res.status(400).json({ success: false, error: 'El código es inválido o ha expirado.' });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(new_password, salt);
+
+        await pool.query(
+            `UPDATE users SET pin_hash = $1, reset_code = NULL, reset_expires = NULL WHERE phone_number = $2`,
+            [hashedPassword, phone_number]
+        );
+
+        res.json({ success: true, message: 'Contraseña actualizada con éxito.' });
+    } catch (error) {
+        console.error('Error en reset-password:', error);
+        res.status(500).json({ success: false, error: 'Error al actualizar la contraseña.' });
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor corriendo en el puerto ${PORT}`);
-}); 
+});   
