@@ -1519,7 +1519,7 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
         let formatType = 'Transferencia P2P';
 
         if (rawType.includes('MERCHANT') || rawType.includes('COMERCIO')) {
-            formatType = 'Pago a Comercio';
+            formatType = 'Venta Recibida';
         } else if (rawType.includes('REFUND')) {
             formatType = 'Devolución / Reembolso';
         } else if (rawType.includes('IN') && !rawType.includes('TRANSFER')) {
