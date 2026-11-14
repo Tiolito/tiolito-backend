@@ -1928,7 +1928,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         const txResult = await client.query(
             `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at) 
              VALUES ($1, $2, $3, $4, 'MERCHANT-PAYMENT', NOW()) RETURNING id, created_at`,
-            [merchantUserId, clientId, clientId, amountToPay]
+            [merchantUserId, clientId, merchantUserId, amountToPay]
         );
 
         await client.query('COMMIT');
