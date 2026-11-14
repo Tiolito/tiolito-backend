@@ -1936,6 +1936,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         };
 
         // 11. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
+        console.log(`📢 Intentando emitir 'payment_received' a la sala: merchant_${merchantUserId}`);
         io.to(`merchant_${merchantUserId}`).emit('payment_received', receiptPayload);
 
         // 12. Responder al cliente
