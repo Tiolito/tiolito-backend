@@ -1469,6 +1469,7 @@ app.post('/api/client/request-withdrawal', verifyToken, async (req, res) => {
 // ==========================================
 app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
     const { folio } = req.body;
+    const currentUserRole = String(req.user.role || '').toUpperCase();
 
     if (!folio || !folio.trim()) {
         return res.status(400).json({ success: false, error: "Ingresa un código de validación o folio." });
@@ -1488,7 +1489,10 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
                 t.id, 
                 t.amount, 
                 t.type,
-                t.created_at, 
+                t.created_at,
+                t.client_id,
+                t.merchant_id,
+                t.agent_id,
                 COALESCE(m_owner.full_name, merchant_user.full_name, agent_user.full_name, 'Comercio Local') AS merchant_name,
                 COALESCE(agent_user.full_name, 'Agente Autorizado') AS agent_name,
                 sender.full_name AS sender_name,
@@ -1519,7 +1523,12 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
         let formatType = 'Transferencia P2P';
 
         if (rawType.includes('MERCHANT') || rawType.includes('COMERCIO')) {
-            formatType = 'Venta Recibida';
+            // 🌟 Si el que busca es CLIENTE dice 'Pago a Comercio', si es COMERCIO/AGENTE dice 'Venta Recibida'
+            if (currentUserRole === 'CLIENT') {
+                formatType = 'Pago a Comercio';
+            } else {
+                formatType = 'Venta Recibida';
+            }
         } else if (rawType.includes('REFUND')) {
             formatType = 'Devolución / Reembolso';
         } else if (rawType.includes('IN') && !rawType.includes('TRANSFER')) {
@@ -1528,18 +1537,28 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
             formatType = 'Retiro (Cash-Out)';
         }
 
+        // 🛡️ Filtro de seguridad anti-duplicidad de nombres
+        let clientNameFinal = tx.client_user_name || tx.sender_name || 'Cliente Tiolito';
+        let merchantNameFinal = tx.merchant_name || 'Comercio Local';
+
+        if (rawType.includes('MERCHANT') || rawType.includes('COMERCIO')) {
+            if (clientNameFinal === merchantNameFinal || String(tx.client_id) === String(tx.merchant_id)) {
+                clientNameFinal = tx.sender_name || 'Cliente Tiolito';
+            }
+        }
+
         res.json({
             success: true,
             transaction: {
                 transactionId: `TRX-${tx.id}`,
                 type: formatType,
                 agentName: tx.agent_name || 'Agente Autorizado',
-                clientName: tx.client_user_name || 'Cliente Tiolito',
-                clientPhone: tx.client_phone || 'N/A',
-                merchantName: tx.merchant_name || 'Comercio Local',
+                clientName: clientNameFinal,
+                clientPhone: tx.client_phone || tx.sender_phone || 'N/A',
+                merchantName: merchantNameFinal,
                 senderName: tx.sender_name || 'Emisor',
-        senderPhone: tx.sender_phone || 'N/A',
-                receiverName: tx.receiver_name || tx.client_user_name || 'Receptor',
+                senderPhone: tx.sender_phone || 'N/A',
+                receiverName: tx.receiver_name || clientNameFinal,
                 receiverPhone: tx.receiver_phone || tx.client_phone || 'N/A',
                 amount: tx.amount,
                 date: new Date(tx.created_at).toLocaleString()
