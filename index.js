@@ -1502,14 +1502,14 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
                 client_user.full_name AS client_user_name,
                 client_user.phone_number AS client_phone
             FROM transactions t
-LEFT JOIN merchants m ON t.merchant_id::text = m.id::text
-LEFT JOIN users m_owner ON m.owner_user_id::text = m_owner.id::text
-LEFT JOIN users merchant_user ON t.merchant_id::text = merchant_user.id::text
-LEFT JOIN users agent_user ON t.agent_id::text = agent_user.id::text
-LEFT JOIN users sender ON t.client_id::text = sender.id::text
-LEFT JOIN users receiver ON t.client_id::text = receiver.id::text
-LEFT JOIN users client_user ON t.client_id::text = client_user.id::text
-WHERE t.id::text = $1::text OR ('TRX-' || t.id::text) ILIKE $1
+            LEFT JOIN merchants m ON t.merchant_id::text = m.id::text
+            LEFT JOIN users m_owner ON m.owner_user_id::text = m_owner.id::text
+            LEFT JOIN users merchant_user ON t.merchant_id::text = merchant_user.id::text
+            LEFT JOIN users agent_user ON t.agent_id::text = agent_user.id::text
+            LEFT JOIN users sender ON t.agent_id::text = sender.id::text     -- 👈 CORREGIDO: Apunta a agent_id (Emisor)
+            LEFT JOIN users receiver ON t.client_id::text = receiver.id::text -- Apunta a client_id (Receptor)
+            LEFT JOIN users client_user ON t.client_id::text = client_user.id::text
+            WHERE t.id::text = $1::text OR ('TRX-' || t.id::text) ILIKE $1
         `;
 
         const result = await pool.query(query, [searchId]);
