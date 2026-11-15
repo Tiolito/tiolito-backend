@@ -1495,20 +1495,19 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
                 t.agent_id,
                 COALESCE(m_owner.full_name, merchant_user.full_name, agent_user.full_name, 'Comercio Local') AS merchant_name,
                 COALESCE(agent_user.full_name, 'Agente Autorizado') AS agent_name,
-                sender.full_name AS sender_name,
-                sender.phone_number AS sender_phone,
+                agent_user.full_name AS agent_sender_name,       -- 👈 Emisor específico para P2P
+                agent_user.phone_number AS agent_sender_phone,
+                client_user.full_name AS client_user_name,       -- 👈 Cliente/Pagador real
+                client_user.phone_number AS client_phone,
                 receiver.full_name AS receiver_name,
-                receiver.phone_number AS receiver_phone,
-                client_user.full_name AS client_user_name,
-                client_user.phone_number AS client_phone
+                receiver.phone_number AS receiver_phone
             FROM transactions t
             LEFT JOIN merchants m ON t.merchant_id::text = m.id::text
             LEFT JOIN users m_owner ON m.owner_user_id::text = m_owner.id::text
             LEFT JOIN users merchant_user ON t.merchant_id::text = merchant_user.id::text
             LEFT JOIN users agent_user ON t.agent_id::text = agent_user.id::text
-            LEFT JOIN users sender ON t.agent_id::text = sender.id::text     -- 👈 CORREGIDO: Apunta a agent_id (Emisor)
-            LEFT JOIN users receiver ON t.client_id::text = receiver.id::text -- Apunta a client_id (Receptor)
             LEFT JOIN users client_user ON t.client_id::text = client_user.id::text
+            LEFT JOIN users receiver ON t.client_id::text = receiver.id::text
             WHERE t.id::text = $1::text OR ('TRX-' || t.id::text) ILIKE $1
         `;
 
@@ -1523,7 +1522,6 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
         let formatType = 'Transferencia P2P';
 
         if (rawType.includes('MERCHANT') || rawType.includes('COMERCIO')) {
-            // 🌟 Si el que busca es CLIENTE dice 'Pago a Comercio', si es COMERCIO/AGENTE dice 'Venta Recibida'
             if (currentUserRole === 'CLIENT') {
                 formatType = 'Pago a Comercio';
             } else {
@@ -1537,14 +1535,30 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
             formatType = 'Retiro (Cash-Out)';
         }
 
-        // 🛡️ Filtro de seguridad anti-duplicidad de nombres
-        let clientNameFinal = tx.client_user_name || tx.sender_name || 'Cliente Tiolito';
+        // 🛡️ Lógica separada y limpia según el tipo de transacción
+        let finalClientName = 'Cliente Tiolito';
+        let finalClientPhone = 'N/A';
+        let finalSenderName = 'Emisor';
+        let finalSenderPhone = 'N/A';
+        let finalReceiverName = 'Receptor';
+        let finalReceiverPhone = 'N/A';
         let merchantNameFinal = tx.merchant_name || 'Comercio Local';
 
         if (rawType.includes('MERCHANT') || rawType.includes('COMERCIO')) {
-            if (clientNameFinal === merchantNameFinal || String(tx.client_id) === String(tx.merchant_id)) {
-                clientNameFinal = tx.sender_name || 'Cliente Tiolito';
-            }
+            // Pagos a Comercio: El cliente pagador viene de client_user_name
+            finalClientName = tx.client_user_name || 'Cliente Tiolito';
+            finalClientPhone = tx.client_phone || 'N/A';
+            finalSenderName = finalClientName;
+            finalSenderPhone = finalClientPhone;
+            finalReceiverName = merchantNameFinal;
+        } else {
+            // Transferencias P2P: El emisor viene de agent_sender_name y el receptor de client_user_name
+            finalSenderName = tx.agent_sender_name || 'Emisor';
+            finalSenderPhone = tx.agent_sender_phone || 'N/A';
+            finalClientName = tx.client_user_name || 'Receptor';
+            finalClientPhone = tx.client_phone || 'N/A';
+            finalReceiverName = tx.client_user_name || 'Receptor';
+            finalReceiverPhone = tx.client_phone || 'N/A';
         }
 
         res.json({
@@ -1553,13 +1567,13 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
                 transactionId: `TRX-${tx.id}`,
                 type: formatType,
                 agentName: tx.agent_name || 'Agente Autorizado',
-                clientName: clientNameFinal,
-                clientPhone: tx.client_phone || tx.sender_phone || 'N/A',
+                clientName: finalClientName,
+                clientPhone: finalClientPhone,
                 merchantName: merchantNameFinal,
-                senderName: tx.sender_name || 'Emisor',
-                senderPhone: tx.sender_phone || 'N/A',
-                receiverName: tx.receiver_name || clientNameFinal,
-                receiverPhone: tx.receiver_phone || tx.client_phone || 'N/A',
+                senderName: finalSenderName,
+                senderPhone: finalSenderPhone,
+                receiverName: finalReceiverName,
+                receiverPhone: finalReceiverPhone,
                 amount: tx.amount,
                 date: new Date(tx.created_at).toLocaleString()
             }
