@@ -2643,19 +2643,20 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // ==========================================
-// ENDPOINT: GET /api/agent/commissions-summary (Comisiones reales del día)
+// ENDPOINT: GET /api/agent/commissions-summary (Ajustado a hora de Guatemala)
 // ==========================================
 app.get('/api/agent/commissions-summary', verifyToken, async (req, res) => {
     const agentId = req.user.id;
 
     try {
-        // Obtenemos todos los retiros (CASH-OUT) procesados por este agente hoy
+        // Comparamos usando la fecha de Guatemala (America/Guatemala)
         const query = `
             SELECT amount
             FROM transactions
             WHERE agent_id::text = $1::text
               AND UPPER(type) = 'CASH-OUT'
-              AND created_at::date = CURRENT_DATE
+              AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = 
+                  (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
         `;
 
         const result = await pool.query(query, [String(agentId)]);
@@ -2663,12 +2664,10 @@ app.get('/api/agent/commissions-summary', verifyToken, async (req, res) => {
 
         let comisionTotalAgenteHoy = 0;
 
-        // Recorremos cada retiro para aplicar exactamente tu misma regla de comisiones
         retiros.forEach(tx => {
             const monto = parseFloat(tx.amount);
             let comisionTotalTransaccion = 0;
 
-            // Tus rangos oficiales definidos en calcularYDividirComision
             if (monto <= 200.00) {
                 comisionTotalTransaccion = 2.00;
             } else if (monto <= 500.00) {
@@ -2679,7 +2678,6 @@ app.get('/api/agent/commissions-summary', verifyToken, async (req, res) => {
                 comisionTotalTransaccion = 16.00;
             }
 
-            // El agente gana estrictamente el 70% de esa comisión
             const comisionAgenteTx = comisionTotalTransaccion * 0.70;
             comisionTotalAgenteHoy += comisionAgenteTx;
         });
