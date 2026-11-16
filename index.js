@@ -402,7 +402,7 @@ const dailySalesResult = await client.query(
   `SELECT COALESCE(SUM(amount), 0) AS total_today 
    FROM transactions 
    WHERE merchant_id = $1 
-     AND created_at::date = CURRENT_DATE`,
+     AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date`,
   [merchant_id]
 );
 
@@ -1631,12 +1631,12 @@ async function validarLimitesAML(req, res, next) {
 
     // 5. Consultar acumulado diario y mensual de forma segura usando el clientId
     const queryAcumulados = `
-      SELECT 
-        COALESCE(SUM(CASE WHEN created_at::date = CURRENT_DATE THEN amount ELSE 0 END), 0) AS total_hoy,
-        COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM created_at) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM CURRENT_DATE) THEN amount ELSE 0 END), 0) AS total_mes
-      FROM transactions 
-      WHERE client_id = $1
-    `;
+  SELECT 
+    COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
+    COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
+  FROM transactions 
+  WHERE client_id = $1
+`;
 
     const result = await pool.query(queryAcumulados, [clientId]);
     const row = result.rows[0] || { total_hoy: 0, total_mes: 0 };
@@ -1741,7 +1741,7 @@ app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
       FROM transactions 
       WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) 
       AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-      AND DATE(created_at) = CURRENT_DATE;
+      AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date;
     `;
     const summaryRes = await pool.query(summaryQuery, [String(merchantId)]);
 
@@ -1884,7 +1884,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         // Consultar acumulado diario del comercio en transacciones de hoy (Convertido a texto para evitar errores)
         const ventasHoyRes = await client.query(
             `SELECT COALESCE(SUM(amount), 0) AS total_hoy FROM transactions 
-             WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) AND created_at::date = CURRENT_DATE`,
+             WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date`,
             [String(merchantUserId)]
         );
         const totalVentasHoy = parseFloat(ventasHoyRes.rows[0].total_hoy || 0);
