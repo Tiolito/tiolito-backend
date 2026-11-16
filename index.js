@@ -171,13 +171,19 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '2h' }
     );
 
+    // 🛡️ Guardar este nuevo token como la única sesión activa del usuario
+    await pool.query(
+      'UPDATE users SET active_token = $1 WHERE id = $2',
+      [token, user.id]
+    );
+
     return res.json({ success: true, token, role: user.role, user_id: user.id, name: user.full_name, tier: user.tier });
 
   } catch (error) {
     console.error("ERROR EN EL LOGIN:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
-});  
+});
 
 app.post('/api/register', async (req, res) => {
   const { phone_number, pin, full_name, role } = req.body;
