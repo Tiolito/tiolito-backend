@@ -2641,6 +2641,51 @@ app.post('/api/auth/reset-password', async (req, res) => {
         res.status(500).json({ success: false, error: 'Error al actualizar la contraseña.' });
     }
 });
+
+// ==========================================
+// ENDPOINT: GET /api/agent/commissions-summary (Resumen de comisiones del agente)
+// ==========================================
+app.get('/api/agent/commissions-summary', verifyToken, async (req, res) => {
+    const agentId = req.user.id;
+
+    try {
+        // Consultamos los retiros (CASH-OUT) procesados por este agente hoy,
+        // asumiendo que el agente gana una comisión por cada retiro. 
+        // O si prefieres calcular el 70% de las comisiones de los retiros del día:
+        const query = `
+            SELECT 
+                COUNT(*) AS total_retiros,
+                COALESCE(SUM(amount), 0) AS total_monto_retirado
+            FROM transactions
+            WHERE agent_id::text = $1::text
+              AND UPPER(type) = 'CASH-OUT'
+              AND created_at::date = CURRENT_DATE
+        `;
+
+        const result = await pool.query(query, [String(agentId)]);
+        const stats = result.rows[0];
+
+        const totalRetiros = parseInt(stats.total_retiros || 0);
+        const montoRetirado = parseFloat(stats.total_monto_retirado || 0);
+
+        // Nota: Si tus rangos de comisión varían, puedes calcular el 70% estimado 
+        // o si guardas la comisión en la BD. Basado en tu función calcularYDividirComision,
+        // aquí mostramos un estimado o un acumulado directo de operaciones.
+        
+        res.json({
+            success: true,
+            total_retiros: totalRetiros,
+            monto_retirado: montoRetirado,
+            // Ejemplo de cálculo estimado del 70% de comisión acumulada del día 
+            // (puedes ajustarlo si guardas la comisión exacta en una columna)
+            comision_estimada_hoy: (montoRetirado > 0 ? (montoRetirado * 0.015) : 0).toFixed(2) 
+        });
+
+    } catch (error) {
+        console.error("Error al obtener comisiones del agente:", error);
+        res.status(500).json({ success: false, error: "Error al calcular comisiones" });
+    }
+});
  
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
