@@ -88,26 +88,53 @@ pool.connect((err, client, release) => {
 // ==========================================
 // MIDDLEWARE: Verificar Token JWT
 // ==========================================
-const verifyToken = (req, res, next) => {
+const verifyToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     
     if (!authHeader) {
         return res.status(401).json({ success: false, error: "Acceso denegado. Token no proporcionado." });
     }
 
-    const token = authHeader.split(' ')[1]; // El formato es "Bearer <token>"
+    const token = authHeader.split(' ')[1];
 
     if (!token) {
         return res.status(401).json({ success: false, error: "Token malformado." });
     }
 
-    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    jwt.verify(token, JWT_SECRET, async (err, decoded) => {
         if (err) {
             return res.status(403).json({ success: false, error: "Token inválido o expirado." });
         }
         
-        req.user = decoded; // Guardamos los datos del usuario decodificados en la petición
-        next();
+        try {
+            // 🛡️ Comprobamos que este token sea la única sesión activa en la base de datos
+            const userResult = await pool.query(
+                'SELECT active_token FROM users WHERE id = $1',
+                [decoded.id]
+            );
+
+            if (userResult.rows.length === 0) {
+                return res.status(401).json({ success: false, error: "Usuario no encontrado." });
+            }
+
+            const dbToken = userResult.rows[0].active_token;
+
+            // ⚠️ Si el token actual no coincide con el de la base de datos, rechazamos la petición
+            if (!dbToken || dbToken !== token) {
+                return res.status(401).json({ 
+                    success: false, 
+                    error: "SESSION_EXPIRED_OTHER_DEVICE",
+                    message: "Tu sesión se cerró porque la cuenta se abrió en otro dispositivo." 
+                });
+            }
+
+            req.user = decoded;
+            next();
+
+        } catch (dbError) {
+            console.error("ERROR AL VERIFICAR SESIÓN ACTIVA:", dbError);
+            return res.status(500).json({ success: false, error: "Error interno del servidor." });
+        }
     });
 };
 
