@@ -1621,29 +1621,39 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
 // ==========================================
 // CONFIGURACIÓN DE LÍMITES AML/PLD (GUATEMALA)
 // ==========================================
-const LIMITE_POR_TRANSACCION = 2000.00;   // Máximo Q2,000.00 por operación
-const LIMITE_DIARIO_ACUMULADO = 5000.00;  // Máximo Q5,000.00 al día por cliente
-const LIMITE_MENSUAL_ACUMULADO = 25000.00; // Máximo Q25,000.00 al mes por cliente
+const LIMITE_POR_TRANSACCION_TIER1 = 2000.00;   
+const LIMITE_DIARIO_ACUMULADO_TIER1 = 5000.00;  
+const LIMITE_MENSUAL_ACUMULADO_TIER1 = 25000.00; 
 
-// Middleware para validar límites de prevención de lavado de dinero y riesgo
+const LIMITE_POR_TRANSACCION_TIER2 = 10000.00;   
+const LIMITE_DIARIO_ACUMULADO_TIER2 = 25000.00;  
+const LIMITE_MENSUAL_ACUMULADO_TIER2 = 100000.00; 
+
+// Middleware para validar límites de prevención de lavado de dinero y riesgo con soporte para Tier 1 y Tier 2
 async function validarLimitesAML(req, res, next) {
   try {
-    // 1. Si la petición viene autenticada por token (como en /api/transfer), 
-    // obtenemos el ID del usuario directamente del token (req.user.id)
     let clientId = req.user?.id;
+    let userTier = 1; // Por defecto asumimos Tier 1 (Estándar)
 
-    // 2. Si no hay token (por ejemplo, en Cash-In o Cash-Out), buscamos por el teléfono en el body
-    if (!clientId) {
+    // 1. Si la petición viene autenticada por token, obtenemos ID y Tier del usuario
+    if (clientId) {
+      const userRes = await pool.query('SELECT id, tier FROM users WHERE id = $1', [clientId]);
+      if (userRes.rows.length > 0) {
+        userTier = Number(userRes.rows[0].tier || 1);
+      }
+    } else {
+      // 2. Si no hay token (ej. en Cash-In o Cash-Out), buscamos por el teléfono en el body
       const phone_number = req.body.phone_number || req.body.client_phone || req.body.telefono || req.body.phone;
-      let userRes = await pool.query('SELECT id FROM users WHERE phone_number = $1', [phone_number]);
+      let userRes = await pool.query('SELECT id, tier FROM users WHERE phone_number = $1', [phone_number]);
       if (userRes.rows.length === 0) {
-        userRes = await pool.query('SELECT id FROM users WHERE telefono = $1', [phone_number]);
+        userRes = await pool.query('SELECT id, tier FROM users WHERE telefono = $1', [phone_number]);
       }
 
       if (userRes.rows.length === 0) {
         return res.status(404).json({ error: 'Cliente no registrado en el sistema' });
       }
       clientId = userRes.rows[0].id;
+      userTier = Number(userRes.rows[0].tier || 1);
     }
 
     const amount = req.body.amount ?? req.body.monto ?? req.body.withdrawAmount ?? 0;
@@ -1654,43 +1664,48 @@ async function validarLimitesAML(req, res, next) {
       return res.status(400).json({ error: 'Ingresa un monto válido mayor a 0.' });
     }
 
-    // 4. Validar límite individual (Q2,000.00)
-    if (montoNum > LIMITE_POR_TRANSACCION) {
-      const limiteFmt = LIMITE_POR_TRANSACCION.toFixed(2);
+    // 4. Seleccionar los límites vigentes según el Tier del cliente
+    const limitePorTransaccion = (userTier === 2) ? LIMITE_POR_TRANSACCION_TIER2 : LIMITE_POR_TRANSACCION_TIER1;
+    const limiteDiarioAcumulado = (userTier === 2) ? LIMITE_DIARIO_ACUMULADO_TIER2 : LIMITE_DIARIO_ACUMULADO_TIER1;
+    const limiteMensualAcumulado = (userTier === 2) ? LIMITE_MENSUAL_ACUMULADO_TIER2 : LIMITE_MENSUAL_ACUMULADO_TIER1;
+
+    // 5. Validar límite individual por transacción
+    if (montoNum > limitePorTransaccion) {
+      const limiteFmt = limitePorTransaccion.toFixed(2);
       return res.status(400).json({
-        error: 'La operación excede el límite permitido de Q' + limiteFmt + ' por transacción.'
+        error: `La operación excede el límite permitido de Q${limiteFmt} por transacción.`
       });
     }
 
-    // 5. Consultar acumulado diario y mensual de forma segura usando el clientId
+    // 6. Consultar acumulado diario y mensual de forma segura usando el clientId
     const queryAcumulados = `
-  SELECT 
-    COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
-    COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
-  FROM transactions 
-  WHERE client_id = $1
-`;
+      SELECT 
+        COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
+        COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
+      FROM transactions 
+      WHERE client_id = $1
+    `;
 
     const result = await pool.query(queryAcumulados, [clientId]);
     const row = result.rows[0] || { total_hoy: 0, total_mes: 0 };
     const totalHoy = parseFloat(row.total_hoy) || 0;
     const totalMes = parseFloat(row.total_mes) || 0;
 
-    // 6. Validar límite diario (Q5,000.00)
-    if (totalHoy + montoNum > LIMITE_DIARIO_ACUMULADO) {
-      const diarioFmt = LIMITE_DIARIO_ACUMULADO.toFixed(2);
+    // 7. Validar límite diario acumulado
+    if (totalHoy + montoNum > limiteDiarioAcumulado) {
+      const diarioFmt = limiteDiarioAcumulado.toFixed(2);
       const hoyFmt = totalHoy.toFixed(2);
       return res.status(400).json({
-        error: 'La operación supera el límite diario permitido (Q' + diarioFmt + '). Acumulado hoy: Q' + hoyFmt + '.'
+        error: `La operación supera el límite diario permitido (Q${diarioFmt}). Acumulado hoy: Q${hoyFmt}.`
       });
     }
 
-    // 7. Validar límite mensual (Q25,000.00)
-    if (totalMes + montoNum > LIMITE_MENSUAL_ACUMULADO) {
-      const mesFmt = LIMITE_MENSUAL_ACUMULADO.toFixed(2);
+    // 8. Validar límite mensual acumulado
+    if (totalMes + montoNum > limiteMensualAcumulado) {
+      const mesFmt = limiteMensualAcumulado.toFixed(2);
       const totalMesFmt = totalMes.toFixed(2);
       return res.status(400).json({
-        error: 'La operación supera el límite mensual permitido (Q' + mesFmt + '). Acumulado este mes: Q' + totalMesFmt + '.'
+        error: `La operación supera el límite mensual permitido (Q${mesFmt}). Acumulado este mes: Q${totalMesFmt}.`
       });
     }
 
