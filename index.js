@@ -1714,7 +1714,7 @@ async function validarLimitesAML(req, res, next) {
     console.error('Error al validar límites AML:', error);
     res.status(500).json({ error: 'Error interno al verificar los límites de seguridad' });
   }
-}
+} 
 
 // ==========================================
 // ENDPOINTS PARA EL ROL DE COMERCIO (MERCHANT)
