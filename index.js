@@ -1683,8 +1683,9 @@ async function validarLimitesAML(req, res, next) {
         COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
         COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
       FROM transactions 
-      WHERE client_id = $1
-    `;
+      WHERE (
+  client_id::text = $1::text
+  OR (agent_id::text = $1::text AND UPPER(type) LIKE '%TRANSFER%')) `;
 
     const result = await pool.query(queryAcumulados, [clientId]);
     const row = result.rows[0] || { total_hoy: 0, total_mes: 0 };
@@ -2747,4 +2748,4 @@ const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor corriendo en el puerto ${PORT}`);
-});   
+});    
