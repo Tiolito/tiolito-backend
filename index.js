@@ -306,8 +306,8 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
             return res.status(400).json({ success: false, error: "No puedes transferir fondos a la misma billetera" });
         }
 
-        // 3. Buscar al receptor por su número de teléfono
-        const receiverResult = await client.query('SELECT id, phone_number, balance FROM users WHERE phone_number = $1 FOR UPDATE', [cleanReceiverPhone]);
+        // 3. Buscar al receptor por su número de teléfono (incluyendo 'role')
+        const receiverResult = await client.query('SELECT id, phone_number, balance, role FROM users WHERE phone_number = $1 FOR UPDATE', [cleanReceiverPhone]);
         if (receiverResult.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, error: "El número de destino no está registrado en el sistema" });
@@ -319,6 +319,37 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
         if (sender.id === receiver.id) {
             await client.query('ROLLBACK');
             return res.status(400).json({ success: false, error: "No puedes transferir fondos a la misma billetera" });
+        }
+
+        // 🛡️ CONTROL ANTI-COMERCIO EN CUENTAS CLIENTE:
+        // Alerta en 10 remitentes únicos al mes | Bloqueo a partir de 15 remitentes únicos al mes
+        if (String(receiver.role || '').toUpperCase() === 'CLIENT') {
+            const remitentesMesRes = await client.query(
+                `SELECT COUNT(DISTINCT agent_id) AS remitentes_unicos
+                 FROM transactions
+                 WHERE client_id::text = $1::text
+                   AND UPPER(type) = 'TRANSFER-OUT'
+                   AND EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))
+                   AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))`,
+                [String(receiver.id)]
+            );
+
+            const totalRemitentes = parseInt(remitentesMesRes.rows[0].remitentes_unicos || 0, 10);
+
+            if (totalRemitentes >= 10 && totalRemitentes < 15) {
+                console.warn(
+                    `⚠️ ALERTA PATRÓN DE COBRO (CLIENT): user_id=${receiver.id}, phone=${receiver.phone_number}, remitentes_unicos_mes=${totalRemitentes}`
+                );
+            }
+
+            if (totalRemitentes >= 15) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    success: false,
+                    code: "MERCHANT_UPGRADE_REQUIRED",
+                    error: "Alcanzaste el límite mensual de 15 personas distintas en transferencias para cuentas personales. Pásate a Cuenta de Comercio para seguir cobrando sin este tope."
+                });
+            }
         }
 
         // 4. Validar saldo suficiente en la tabla users (o wallets según tu diseño)
@@ -358,7 +389,7 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
         const senderInfo = userNamesRes.rows.find(u => u.id === sender_id) || { full_name: req.user.name || 'Emisor', phone_number: sender.phone_number };
         const receiverInfo = userNamesRes.rows.find(u => u.id === receiver.id) || { full_name: 'Destinatario', phone_number: cleanReceiverPhone };
 
-       // 👈 Usamos directamente el ID de la base de datos para mantener el formato corto TRX-ID
+        // 👈 Usamos directamente el ID de la base de datos para mantener el formato corto TRX-ID
         const shortFolio = `TRX-${transactionResult.rows[0].id}`;
 
         // 🚀 NUEVO: Preparamos el paquete de datos para el socket en tiempo real
