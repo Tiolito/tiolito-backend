@@ -273,6 +273,9 @@ app.get('/api/transactions/:user_id', async (req, res) => {
     }
 });
 
+// Función auxiliar para estandarizar teléfonos (solo dígitos)
+const normalizePhone = (phone) => String(phone || '').replace(/\D/g, '').trim();
+
 // ==========================================
 // 5. ENDPOINT: POST /api/transfer (Transferencia P2P por Teléfono)
 // ==========================================
@@ -280,12 +283,14 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
     const sender_id = req.user.id; // Obtenemos el ID del emisor desde el Token JWT
     const { receiver_phone, amount } = req.body;
 
-    if (!receiver_phone || !amount || parseFloat(amount) <= 0) {
+    const cleanReceiverPhone = normalizePhone(receiver_phone);
+    const rawAmount = parseFloat(amount);
+    const transferAmount = Number.isFinite(rawAmount) ? Math.round(rawAmount * 100) / 100 : NaN;
+
+    if (!cleanReceiverPhone || cleanReceiverPhone.length < 8 || Number.isNaN(transferAmount) || transferAmount <= 0) {
         return res.status(400).json({ success: false, error: "Ingresa un número de teléfono y un monto válido." });
     }
 
-    const cleanReceiverPhone = String(receiver_phone).trim();
-    const transferAmount = parseFloat(amount);
     const client = await pool.connect();
 
     try {
@@ -299,15 +304,22 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
         }
 
         const sender = senderResult.rows[0];
+        const cleanSenderPhone = normalizePhone(sender.phone_number);
 
-        // 2. Validar si intenta transferirse a su propio número
-        if (sender.phone_number && sender.phone_number.trim() === cleanReceiverPhone) {
+        // 2. Validar si intenta transferirse a su propio número (normalizado)
+        if (cleanSenderPhone && cleanSenderPhone === cleanReceiverPhone) {
             await client.query('ROLLBACK');
             return res.status(400).json({ success: false, error: "No puedes transferir fondos a la misma billetera" });
         }
 
-        // 3. Buscar al receptor por su número de teléfono (incluyendo 'role')
-        const receiverResult = await client.query('SELECT id, phone_number, balance, role FROM users WHERE phone_number = $1 FOR UPDATE', [cleanReceiverPhone]);
+        // 3. Buscar al receptor por su número de teléfono normalizado (incluyendo 'role')
+        const receiverResult = await client.query(
+            `SELECT id, phone_number, balance, role
+             FROM users
+             WHERE REGEXP_REPLACE(COALESCE(phone_number, ''), '\\D', '', 'g') = $1
+             FOR UPDATE`,
+            [cleanReceiverPhone]
+        );
         if (receiverResult.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, error: "El número de destino no está registrado en el sistema" });
@@ -359,8 +371,8 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
             }
         }
 
-        // 4. Validar saldo suficiente en la tabla users (o wallets según tu diseño)
-        const senderBalance = parseFloat(sender.balance || 0);
+        // 4. Validar saldo suficiente (redondeado a 2 decimales para evitar errores de punto flotante)
+        const senderBalance = Math.round(parseFloat(sender.balance || 0) * 100) / 100;
         if (senderBalance < transferAmount) {
             await client.query('ROLLBACK');
             return res.status(400).json({ success: false, error: "Saldo insuficiente para realizar la transferencia" });
@@ -368,13 +380,13 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
 
         // 5. Descontar al emisor
         await client.query(
-            'UPDATE users SET balance = balance - $1 WHERE id = $2',
+            'UPDATE users SET balance = ROUND((COALESCE(balance, 0) - $1)::numeric, 2) WHERE id = $2',
             [transferAmount, sender_id]
         );
 
         // 6. Acreditar al receptor
         await client.query(
-            'UPDATE users SET balance = balance + $1 WHERE id = $2',
+            'UPDATE users SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2) WHERE id = $2',
             [transferAmount, receiver.id]
         );
 
@@ -399,7 +411,7 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
         // 👈 Usamos directamente el ID de la base de datos para mantener el formato corto TRX-ID
         const shortFolio = `TRX-${transactionResult.rows[0].id}`;
 
-        // 🚀 NUEVO: Preparamos el paquete de datos para el socket en tiempo real
+        // 🚀 Preparamos el paquete de datos para el socket en tiempo real
         const transferPayload = {
             folio: shortFolio,
             id: transactionResult.rows[0].id,
@@ -412,7 +424,7 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
             created_at: new Date()
         };
 
-        // 🚀 NUEVO: Notificar instantáneamente al receptor en su propia sala
+        // 🚀 Notificar instantáneamente al receptor en su propia sala
         io.to(`client_${receiver.id}`).emit('transfer_received', transferPayload);
 
         res.status(200).json({
@@ -423,7 +435,7 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error("Error en /api/transfer:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Ocurrió un error al procesar la transferencia. Intenta de nuevo." });
     } finally {
         client.release();
     }
