@@ -430,6 +430,61 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
 });
 
 // ==========================================
+// ESTADO DE LÍMITE COMERCIAL PARA CUENTAS CLIENTE
+// ==========================================
+app.get('/api/account/merchant-status', verifyToken, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        const userRes = await pool.query(
+            'SELECT id, role FROM users WHERE id = $1',
+            [userId]
+        );
+
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Usuario no encontrado' });
+        }
+
+        const role = String(userRes.rows[0].role || '').toUpperCase();
+
+        if (role !== 'CLIENT') {
+            return res.status(200).json({
+                success: true,
+                upgradeRequired: false,
+                uniqueSenders: 0,
+                limit: 15
+            });
+        }
+
+        const countRes = await pool.query(
+            `SELECT COUNT(DISTINCT agent_id) AS remitentes_unicos
+             FROM transactions
+             WHERE client_id::text = $1::text
+               AND UPPER(type) = 'TRANSFER-OUT'
+               AND EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))
+               AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))`,
+            [String(userId)]
+        );
+
+        const uniqueSenders = parseInt(countRes.rows[0]?.remitentes_unicos || 0, 10);
+        const upgradeRequired = uniqueSenders >= 15;
+
+        return res.status(200).json({
+            success: true,
+            upgradeRequired,
+            uniqueSenders,
+            limit: 15,
+            message: upgradeRequired
+                ? 'Tu cuenta personal alcanzó el límite mensual de 15 personas distintas recibiendo transferencias. Pásate a Cuenta de Comercio para seguir cobrando sin este tope.'
+                : null
+        });
+    } catch (error) {
+        console.error('Error en /api/account/merchant-status:', error);
+        return res.status(500).json({ success: false, error: 'No se pudo verificar el estado de la cuenta' });
+    }
+});
+
+// ==========================================
 // 6. ENDPOINT: POST /api/merchant/charge (Cobro a Negocios / Comercios)
 // ==========================================
 app.post('/api/merchant/charge', verifyToken, async (req, res) => {
