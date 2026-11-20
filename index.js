@@ -344,10 +344,17 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
 
             if (totalRemitentes >= 15) {
                 await client.query('ROLLBACK');
+
+                // Notificar a la cuenta receptora que ya alcanzó su límite mensual como CLIENT
+                io.to(`client_${receiver.id}`).emit('merchant_upgrade_required', {
+                    code: "MERCHANT_UPGRADE_REQUIRED",
+                    message: "Tu cuenta personal alcanzó el límite mensual de 15 personas distintas recibiendo transferencias. Pásate a Cuenta de Comercio para seguir cobrando sin este tope."
+                });
+
                 return res.status(400).json({
                     success: false,
-                    code: "MERCHANT_UPGRADE_REQUIRED",
-                    error: "Alcanzaste el límite mensual de 15 personas distintas en transferencias para cuentas personales. Pásate a Cuenta de Comercio para seguir cobrando sin este tope."
+                    code: "RECEIVER_LIMIT_REACHED",
+                    error: "La cuenta de destino alcanzó el límite mensual de transferencias recibidas de distintos usuarios (15) para cuentas personales."
                 });
             }
         }
