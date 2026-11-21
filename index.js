@@ -37,7 +37,7 @@ io.on('connection', (socket) => {
     console.log('Socket desconectado:', socket.id);
   });
 });
-const JWT_SECRET = 'secreto_jwt';
+const JWT_SECRET = process.env.JWT_SECRET || 'secreto_jwt';
 app.use(cors());
 app.use(express.json());
 
@@ -156,16 +156,24 @@ const requireRole = (...allowedRoles) => {
     };
 };
 
+const round2 = (val) => Math.round((Number(val) + Number.EPSILON) * 100) / 100;
+
 // ==========================================
 // 3. ENDPOINT: GET /api/wallets/:user_id
-// ========================================== 
+// ==========================================
 app.get('/api/wallets/:user_id', verifyToken, async (req, res) => {
     const { user_id } = req.params;
+    const requesterId = String(req.user?.id || '');
+    const requesterRole = String(req.user?.role || '').toUpperCase();
+
+    if (requesterRole !== 'ADMIN' && String(user_id) !== requesterId) {
+        return res.status(403).json({ success: false, error: 'Acceso denegado.' });
+    }
 
     try {
         const result = await pool.query(
-            'SELECT w.id, w.user_id, w.balance, w.currency, w.updated_at, u.full_name, u.role FROM wallets w JOIN users u ON w.user_id = u.id WHERE w.user_id = $1',
-            [user_id]
+            'SELECT w.id, w.user_id, w.balance, w.currency, w.updated_at, u.full_name, u.role FROM wallets w JOIN users u ON w.user_id = u.id WHERE w.user_id::text = $1::text',
+            [String(user_id)]
         );
 
         if (result.rows.length === 0) {
@@ -179,14 +187,13 @@ app.get('/api/wallets/:user_id', verifyToken, async (req, res) => {
 
     } catch (error) {
         console.error("Error en GET /api/wallets:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al consultar la billetera" });
     }
 });
 
 // ==========================================
 // ENDPOINT: POST /api/login (Autenticación JWT)
 // ==========================================
-
 app.post('/api/login', async (req, res) => {
   const phone_number = req.body.phone_number || req.body.email;
   const inputPassword = req.body.pin || req.body.password;
@@ -202,8 +209,8 @@ app.post('/api/login', async (req, res) => {
     }
 
     const user = userResult.rows[0];
-    
-    // 🔒 Validación estricta únicamente mediante bcrypt
+
+    // Validación estricta únicamente mediante bcrypt
     const isValidPassword = await bcrypt.compare(inputPassword, user.pin_hash);
 
     if (!isValidPassword) {
@@ -216,7 +223,7 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '2h' }
     );
 
-    // 🛡️ Guardar este nuevo token como la única sesión activa del usuario
+    // Guardar este nuevo token como la única sesión activa del usuario
     await pool.query(
       'UPDATE users SET active_token = $1 WHERE id = $2',
       [token, user.id]
@@ -226,7 +233,7 @@ app.post('/api/login', async (req, res) => {
 
   } catch (error) {
     console.error("ERROR EN EL LOGIN:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({ success: false, error: "Error interno al iniciar sesión" });
   }
 });
 
@@ -235,11 +242,17 @@ app.post('/api/login', async (req, res) => {
 // ==========================================
 app.get('/api/transactions/:user_id', verifyToken, async (req, res) => {
     const { user_id } = req.params;
+    const requesterId = String(req.user?.id || '');
+    const requesterRole = String(req.user?.role || '').toUpperCase();
+
+    if (requesterRole !== 'ADMIN' && String(user_id) !== requesterId) {
+        return res.status(403).json({ success: false, error: 'Acceso denegado.' });
+    }
 
     try {
         const result = await pool.query(
-            'SELECT * FROM transactions WHERE client_id = $1 ORDER BY created_at DESC',
-            [user_id]
+            'SELECT * FROM transactions WHERE client_id::text = $1::text ORDER BY created_at DESC',
+            [String(user_id)]
         );
 
         res.status(200).json({
@@ -250,7 +263,7 @@ app.get('/api/transactions/:user_id', verifyToken, async (req, res) => {
 
     } catch (error) {
         console.error("Error en GET /api/transactions:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al consultar transacciones" });
     }
 });
 
@@ -478,154 +491,12 @@ app.get('/api/account/merchant-status', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// 6. ENDPOINT: POST /api/merchant/charge (Cobro a Negocios / Comercios)
-// ==========================================
-app.post('/api/merchant/charge', verifyToken, async (req, res) => {
-    const { client_id, merchant_id, amount } = req.body;
-    const userIdFromToken = req.user.id; // Del token JWT
-    const client = await pool.connect();
-    
-    try {
-        await client.query('BEGIN');
-
-       // Validar que el comercio exista, pertenezca al usuario y traer sus límites
-const merchantResult = await client.query(
-  'SELECT tier, max_per_tx, max_daily FROM merchants WHERE id = $1 AND owner_user_id = $2',
-  [merchant_id, userIdFromToken]
-);
-
-if (merchantResult.rows.length === 0) {
-  await client.query('ROLLBACK');
-  return res.status(403).json({
-    success: false,
-    error: "No tienes autorización o el comercio no existe"
-  });
-}
-
-const merchant = merchantResult.rows[0];
-const maxPerTx = Number(merchant.max_per_tx);
-const maxDaily = Number(merchant.max_daily);
-const payAmount = Number(amount);
-
-// 2. Validar límite por transacción individual
-if (payAmount > maxPerTx) {
-  await client.query('ROLLBACK');
-  return res.status(400).json({
-    success: false,
-    error: `Este comercio tiene un límite máximo de Q${maxPerTx.toFixed(2)} por transacción.`
-  });
-}
-
-// 3. Validar acumulado diario de ventas del comercio (usando client.query)
-const dailySalesResult = await client.query(
-  `SELECT COALESCE(SUM(amount), 0) AS total_today 
-   FROM transactions 
-   WHERE merchant_id = $1 
-     AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date`,
-  [merchant_id]
-);
-
-const totalToday = Number(dailySalesResult.rows[0].total_today);
-
-if (totalToday + payAmount > maxDaily) {
-  await client.query('ROLLBACK');
-  return res.status(400).json({
-    success: false,
-    error: `El comercio ha alcanzado su límite diario de ventas (Máx. Q${maxDaily.toFixed(2)}).`
-  });
-}
-
-        if (merchantResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ 
-                success: false, 
-                error: "No tienes autorización para realizar cobros a nombre de este comercio" 
-            });
-        }
-
-        const merchantName = merchantResult.rows[0].name;
-        const merchantUserId = merchantResult.rows[0].owner_user_id; //
-
-        if (client_id === merchantUserId) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: "Un comercio no se puede cobrar a sí mismo" });
-        }
-
-        const chargeAmount = parseFloat(amount);
-        if (isNaN(chargeAmount) || chargeAmount <= 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: "El monto del cobro debe ser mayor a cero" });
-        }
-
-        // Verificar y bloquear la billetera del cliente pagador
-        const clientWallet = await client.query(
-            'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
-            [client_id]
-        );
-
-        if (clientWallet.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, error: "Billetera del cliente no encontrada" });
-        }
-
-        const clientBalance = parseFloat(clientWallet.rows[0].balance);
-        if (clientBalance < chargeAmount) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: "Saldo insuficiente en la billetera del cliente" });
-        }
-
-        // Verificar y bloquear la billetera del comercio receptor
-        const merchantWallet = await client.query(
-            'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
-            [merchantUserId]
-        );
-
-        if (merchantWallet.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, error: "Billetera del comercio receptor no encontrada" });
-        }
-
-        // Descontar saldo al cliente
-        await client.query(
-            'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2',
-            [chargeAmount, client_id]
-        );
-
-        // Acreditar saldo al comercio
-        await client.query(
-            'UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id = $2',
-            [chargeAmount, merchantUserId]
-        );
-
-        // Registrar la transacción de cobro incluyendo el merchant_id y agent_id del usuario
-const transactionResult = await client.query(
-    `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at)
-     VALUES ($1, $2, $3, $4, 'MERCHANT-PAYMENT', NOW()) RETURNING *;`,
-    [merchantUserId, client_id, merchant_id, chargeAmount]
-);
-
-        await client.query('COMMIT');
-        res.status(200).json({
-            success: true,
-           message: `Pago procesado con éxito para ${merchantName}`,
-            transaction: transactionResult.rows[0]
-        });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("Error en /api/merchant/charge:", error);
-        res.status(500).json({ success: false, error: error.message });
-    } finally {
-        client.release();
-    }
-});
-
-// ==========================================
 // 8. ENDPOINT: POST /api/merchant/refund (Reversión de cobros)
 // ==========================================
 app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     const { transaction_id } = req.body;
-    const merchantId = req.user.id;
-    
+    const merchantId = String(req.user.id);
+
     if (!transaction_id) {
         return res.status(400).json({ success: false, error: "ID de transacción no proporcionado" });
     }
@@ -637,12 +508,13 @@ app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'
 
         const cleanId = String(transaction_id).replace('TRX-', '').trim();
 
-        // 1. Buscar la transacción original
+        // 1. Buscar y bloquear la transacción original
         const txResult = await client.query(
             `SELECT * FROM transactions 
              WHERE id::text = $1 
-               AND (agent_id::text = $2::text OR merchant_id::text = $2::text)`,
-            [cleanId, String(merchantId)]
+               AND (agent_id::text = $2::text OR merchant_id::text = $2::text)
+             FOR UPDATE`,
+            [cleanId, merchantId]
         );
 
         if (txResult.rows.length === 0) {
@@ -651,51 +523,93 @@ app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'
         }
 
         const transaction = txResult.rows[0];
-        const refundAmount = parseFloat(transaction.amount);
-        const clientId = transaction.client_id;
+        const refundAmount = round2(parseFloat(transaction.amount));
+        if (isNaN(refundAmount) || refundAmount <= 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, error: "Monto de transacción inválido para reembolso" });
+        }
+
+        const clientId = transaction.client_id ? String(transaction.client_id) : null;
+
+        // Bloquear cuentas involucradas en orden determinista para evitar deadlocks
+        const accountIds = clientId
+            ? [merchantId, clientId].sort((a, b) => a.localeCompare(b))
+            : [merchantId];
+
+        const lockedUsers = new Map();
+        for (const accId of accountIds) {
+            const uRes = await client.query(
+                'SELECT id, balance FROM users WHERE id::text = $1::text FOR UPDATE',
+                [accId]
+            );
+            if (uRes.rows.length > 0) {
+                lockedUsers.set(accId, uRes.rows[0]);
+            }
+        }
+
+        const merchantRow = lockedUsers.get(merchantId);
+        if (!merchantRow) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: "Comercio no encontrado" });
+        }
+
+        const merchantBalance = round2(parseFloat(merchantRow.balance || 0));
+        if (merchantBalance < refundAmount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente en comercio para reembolsar (disponible: Q${merchantBalance.toFixed(2)}).`
+            });
+        }
 
         // 2. Devolver el dinero al cliente (si existe)
-        if (clientId) {
+        if (clientId && lockedUsers.has(clientId)) {
             await client.query(
-                'UPDATE users SET balance = balance + $1 WHERE id::text = $2::text',
-                [refundAmount, String(clientId)]
+                'UPDATE users SET balance = ROUND((balance + $1)::numeric, 2) WHERE id::text = $2::text',
+                [refundAmount, clientId]
             );
         }
 
-        // 3. Descontar el dinero del saldo/caja del comercio
+        // 3. Descontar el dinero del saldo del comercio
         await client.query(
-            'UPDATE users SET balance = balance - $1 WHERE id::text = $2::text',
-            [refundAmount, String(merchantId)]
+            'UPDATE users SET balance = ROUND((balance - $1)::numeric, 2) WHERE id::text = $2::text',
+            [refundAmount, merchantId]
         );
 
         // 4. Eliminar el registro original de la venta
         await client.query('DELETE FROM transactions WHERE id::text = $1::text', [cleanId]);
 
-        // 5. Registrar la transacción de reembolso reutilizando agent_id y merchant_id originales
+        // 5. Registrar la transacción de reembolso
         const refundTx = await client.query(
             `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at)
              VALUES ($1, $2, $3, $4, 'REFUND', NOW()) RETURNING id, created_at`,
             [transaction.agent_id, clientId, transaction.merchant_id, refundAmount]
         );
 
-        io.to(`client_${clientId}`).emit('transaction_update', {
-    type: 'REFUND',
-    message: `Has recibido una devolución de Q${refundAmount}`,
-    amount: refundAmount
-});
-
         await client.query('COMMIT');
-        
-        res.json({ 
-            success: true, 
-            message: `Reembolso de Q${refundAmount} procesado con éxito`,
+
+        if (clientId) {
+            io.to(`client_${clientId}`).emit('transaction_update', {
+                type: 'REFUND',
+                message: `Has recibido una devolución de Q${refundAmount.toFixed(2)}`,
+                amount: refundAmount
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: `Reembolso de Q${refundAmount.toFixed(2)} procesado con éxito`,
             refund_transaction_id: refundTx.rows[0].id
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (refund):', rollbackErr);
+        }
         console.error("Error al procesar la devolución:", error);
-        res.status(500).json({ success: false, error: "Error al procesar el reembolso en el servidor: " + error.message });
+        return res.status(500).json({ success: false, error: "Error interno al procesar el reembolso." });
     } finally {
         client.release();
     }
@@ -721,38 +635,6 @@ app.get('/api/client/balance', verifyToken, async (req, res) => {
     } catch (error) {
         console.error("Error al consultar saldo:", error);
         res.status(500).json({ success: false, error: "Error al obtener el saldo" });
-    }
-});
-
-// ==========================================
-// 10. ENDPOINT: POST /api/client/deposit (Recargar saldo)
-// ==========================================
-app.post('/api/client/deposit', verifyToken, async (req, res) => {
-    const userIdFromToken = req.user.id;
-    const { amount } = req.body;
-
-    if (!amount || amount <= 0) {
-        return res.status(400).json({ success: false, error: "El monto debe ser mayor a cero" });
-    }
-
-    try {
-        const result = await pool.query(
-            'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING id, full_name, balance',
-            [amount, userIdFromToken]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, error: "Usuario no encontrado" });
-        }
-
-        res.json({ 
-            success: true, 
-            message: "Depósito realizado con éxito", 
-            client: result.rows[0] 
-        });
-    } catch (error) {
-        console.error("Error al procesar el depósito:", error);
-        res.status(500).json({ success: false, error: "Error al realizar la recarga" });
     }
 });
 
@@ -803,41 +685,6 @@ app.get('/api/client/transactions', verifyToken, async (req, res) => {
     } catch (error) {
         console.error("Error al obtener historial del cliente:", error);
         res.status(500).json({ success: false, error: "Error al obtener el historial de transacciones" });
-    }
-});
-
-// ==========================================
-// 12. ENDPOINT: POST /api/agent/deposit (Recarga a cliente por punto físico)
-// ==========================================
-app.post('/api/agent/deposit', verifyToken, async (req, res) => {
-    const agentUserId = req.user.id;
-    const { client_id, amount } = req.body;
-
-    // Verificar datos de entrada
-    if (!client_id || !amount || amount <= 0) {
-        return res.status(400).json({ success: false, error: "Cliente y monto válido (mayor a 0) son requeridos" });
-    }
-
-    try {
-        // Aumentar el saldo del cliente
-        const updateClient = await pool.query(
-            'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING id, full_name, balance',
-            [amount, client_id]
-        );
-
-        if (updateClient.rows.length === 0) {
-            return res.status(404).json({ success: false, error: "Cliente no encontrado" });
-        }
-
-        res.json({
-            success: true,
-            message: "Recarga realizada exitosamente al cliente",
-            agent_id: agentUserId,
-            client: updateClient.rows[0]
-        });
-    } catch (error) {
-        console.error("Error al procesar la recarga del agente:", error);
-        res.status(500).json({ success: false, error: "Error interno al procesar la recarga" });
     }
 });
 
@@ -902,115 +749,137 @@ app.get('/api/agent/transactions', verifyToken, requireRole('AGENT'), async (req
   }
 });
 
+// ==========================================
+// CASH-IN (Depósito en efectivo por Agente)
+// ==========================================
 app.post('/api/cash-in', verifyToken, requireRole('AGENT'), validarLimitesAML, async (req, res) => {
+  const agent_id = req.user.id;
+  const rawPhone = req.body.phone_number || req.body.client_phone || req.body.phone;
+  const cleanPhone = normalizePhone(rawPhone);
+  const rawAmount = parseFloat(req.body.amount ?? req.body.monto);
+  const depositAmount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
+
+  if (!cleanPhone || cleanPhone.length < 8 || Number.isNaN(depositAmount) || depositAmount <= 0) {
+    return res.status(400).json({ success: false, error: "Falta un teléfono válido o un monto mayor a cero" });
+  }
+
+  const client = await pool.connect();
   try {
-    const targetPhone = req.body.phone_number || req.body.client_phone || req.body.phone;
-    const amount = req.body.amount || req.body.monto;
+    await client.query('BEGIN');
 
-    let agent_id = null;
-    const authHeader = req.headers['authorization'];
-  
-    if (authHeader) {
-      try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, 'secreto_jwt');
-        agent_id = decoded.id || decoded.userId;
-      } catch (e) {
-        console.log("Error al verificar token en cash-in:", e.message);
-      }
-    }
+    // Bloquear agente primero para evitar carreras en su caja/saldo
+    const agentRes = await client.query(
+      'SELECT id, balance, full_name FROM users WHERE id::text = $1::text FOR UPDATE',
+      [String(agent_id)]
+    );
 
-    if (!agent_id) {
-      return res.status(401).json({ success: false, error: "No autorizado. Inicia sesión como agente." });
-    }
-
-    if (!targetPhone || !amount) {
-      return res.status(400).json({ success: false, error: "Falta el teléfono o el monto" });
-    }
-
-    const depositAmount = parseFloat(amount);
-
-    // 🛑 Validar saldo del agente antes de depositar
-    const agentCheck = await pool.query('SELECT balance FROM users WHERE id = $1', [agent_id]);
-    if (agentCheck.rows.length === 0) {
+    if (agentRes.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ success: false, error: "Agente no encontrado" });
     }
 
-    const agentBalance = parseFloat(agentCheck.rows[0].balance || 0);
+    const agentData = agentRes.rows[0];
+    const agentBalance = round2(parseFloat(agentData.balance || 0));
+
     if (agentBalance < depositAmount) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Saldo de agente insuficiente. Tu saldo disponible es de Q${agentBalance.toFixed(2)} y necesitas Q${depositAmount.toFixed(2)}.` 
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        error: `Saldo de agente insuficiente. Tu saldo disponible es de Q${agentBalance.toFixed(2)} y necesitas Q${depositAmount.toFixed(2)}.`
       });
     }
 
-    let clientResult = await pool.query(
-      'SELECT id, full_name, balance FROM users WHERE phone_number = $1',
-      [targetPhone]
+    // Buscar y bloquear al cliente por teléfono normalizado
+    const clientLookup = await client.query(
+      `SELECT id, full_name, phone_number, balance
+       FROM users
+       WHERE REGEXP_REPLACE(COALESCE(phone_number, ''), '\\D', '', 'g') = $1
+       FOR UPDATE`,
+      [cleanPhone]
     );
 
     let client_id;
     let newBalance;
     let clientName = 'Cliente Validado';
 
-    if (clientResult.rows.length === 0) {
-      const newUser = await pool.query(
-        'INSERT INTO users (phone_number, balance, full_name) VALUES ($1, $2, $3) RETURNING id, balance, full_name',
-        [targetPhone, amount, 'Cliente Nuevo']
+    if (clientLookup.rows.length === 0) {
+      const tempPinHash = await bcrypt.hash(Math.floor(100000 + Math.random() * 900000).toString(), 10);
+      const newUser = await client.query(
+        `INSERT INTO users (phone_number, pin_hash, balance, full_name, role, is_verified)
+         VALUES ($1, $2, $3, $4, 'CLIENT', TRUE)
+         RETURNING id, balance, full_name`,
+        [cleanPhone, tempPinHash, depositAmount, 'Cliente Nuevo']
       );
       client_id = newUser.rows[0].id;
-      newBalance = parseFloat(amount);
+      newBalance = depositAmount;
       clientName = newUser.rows[0].full_name;
     } else {
-      const client = clientResult.rows[0];
-      client_id = client.id;
-      clientName = client.full_name || 'Cliente';
-      newBalance = parseFloat(client.balance || 0) + parseFloat(amount);
+      const targetClient = clientLookup.rows[0];
+      client_id = targetClient.id;
+      clientName = targetClient.full_name || 'Cliente';
+      const currentClientBalance = round2(parseFloat(targetClient.balance || 0));
+      newBalance = round2(currentClientBalance + depositAmount);
 
-      await pool.query('UPDATE users SET balance = $1 WHERE id = $2', [newBalance, client_id]);
-      await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amount, agent_id]);
-      await pool.query('UPDATE wallets SET balance = balance - $1 WHERE user_id = $2', [amount, agent_id]);
+      await client.query(
+        'UPDATE users SET balance = $1 WHERE id::text = $2::text',
+        [newBalance, String(client_id)]
+      );
     }
 
-    // 🔍 CONSULTAR EL NOMBRE REAL DEL AGENTE DIRECTAMENTE DE LA BASE DE DATOS
-    const agentInfoRes = await pool.query('SELECT full_name FROM users WHERE id = $1', [agent_id]);
-    const realAgentName = agentInfoRes.rows[0]?.full_name || 'Punto Agente Tiolito';
+    // Descontar del agente en users y wallets si existe registro
+    const newAgentBalance = round2(agentBalance - depositAmount);
+    await client.query(
+      'UPDATE users SET balance = $1 WHERE id::text = $2::text',
+      [newAgentBalance, String(agent_id)]
+    );
+    await client.query(
+      'UPDATE wallets SET balance = ROUND((balance - $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+      [depositAmount, String(agent_id)]
+    );
 
-    // 1. Generamos el folio único de autorización
+    const realAgentName = agentData.full_name || 'Punto Agente Tiolito';
     const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
-   // 2. Registrar transacción (Agregando RETURNING id)
-    const txResult = await pool.query(
-        "INSERT INTO transactions (agent_id, client_id, amount, type) VALUES ($1, $2, $3, 'CASH-IN') RETURNING id, created_at",
-        [agent_id, client_id, amount]
+    const txResult = await client.query(
+      `INSERT INTO transactions (agent_id, client_id, amount, type, created_at)
+       VALUES ($1, $2, $3, 'CASH-IN', NOW())
+       RETURNING id, created_at`,
+      [agent_id, client_id, depositAmount]
     );
     const transactionIdShort = txResult.rows[0].id;
 
-    // 🚀 Avisar al cliente en tiempo real
+    await client.query('COMMIT');
+
     io.to(`client_${client_id}`).emit('balance_updated', {
-        type: "Depósito (Cash-In)",
-        amount: amount,
-        created_at: new Date()
+      type: "Depósito (Cash-In)",
+      amount: depositAmount,
+      created_at: new Date()
     });
 
-    // 3. Devolvemos la respuesta con el nombre real del agente
     return res.json({
-        success: true,
-        new_balance: newBalance,
-        transaction: {
-            id: transactionIdShort,
-            folio: folioUnico,
-            type: "Depósito (Cash-In)",
-            agent_name: realAgentName,     // 👈 Nombre real garantizado desde la BD
-            client_name: clientName,   
-            client_phone: targetPhone, 
-            amount: amount,
-            created_at: new Date()
-        }
+      success: true,
+      new_balance: newBalance,
+      transaction: {
+        id: transactionIdShort,
+        folio: folioUnico,
+        type: "Depósito (Cash-In)",
+        agent_name: realAgentName,
+        client_name: clientName,
+        client_phone: cleanPhone,
+        amount: depositAmount,
+        created_at: new Date()
+      }
     });
   } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Error en ROLLBACK (cash-in):', rollbackErr);
+    }
     console.error("ERROR EN CASH-IN:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({ success: false, error: "Error interno al procesar el depósito." });
+  } finally {
+    client.release();
   }
 });
 
@@ -1045,74 +914,97 @@ function calcularYDividirComision(montoRetiro) {
     };
 }
 
+// ==========================================
+// CASH-OUT (Retiro en efectivo por Agente)
+// ==========================================
 app.post('/api/cash-out', verifyToken, requireRole('AGENT'), validarLimitesAML, async (req, res) => {
+  const agent_id = req.user.id;
+  const agentNameFromToken = req.user.name || 'Punto Agente Tiolito';
+  const rawPhone = req.body.client_phone || req.body.phone || req.body.phoneNumber || req.body.phone_number;
+  const cleanPhone = normalizePhone(rawPhone);
+  const rawAmount = parseFloat(req.body.amount ?? req.body.monto);
+  const withdrawAmount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
+  const code = req.body.code ? String(req.body.code).trim() : null;
+
+  if (!cleanPhone || cleanPhone.length < 8 || Number.isNaN(withdrawAmount) || withdrawAmount <= 0) {
+    return res.status(400).json({ success: false, error: "Falta un teléfono válido o un monto mayor a cero" });
+  }
+
+  let comisionesBase;
   try {
-    const targetPhone = req.body.client_phone || req.body.phone || req.body.phoneNumber || req.body.phone_number;
-    const amount = req.body.amount || req.body.monto;
+    comisionesBase = calcularYDividirComision(withdrawAmount);
+  } catch (limitErr) {
+    return res.status(400).json({ success: false, error: limitErr.message });
+  }
 
-    let agent_id = null;
-    let agentName = 'Punto Agente Tiolito';
-    const authHeader = req.headers['authorization'];
-  
-    if (authHeader) {
-      try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, 'secreto_jwt');
-        agent_id = decoded.id || decoded.userId;
-        
-        if (decoded.name) {
-          agentName = decoded.name;
-        }
-      } catch (e) {
-        console.log("Error al verificar token en cash-in:", e.message);
-      }
-    }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-    if (!agent_id) {
-      return res.status(401).json({ success: false, error: "No autorizado. Inicia sesión como agente." });
-    }
-
-    if (!targetPhone || !amount) {
-      return res.status(400).json({ success: false, error: "Falta el teléfono o el monto" });
-    }
-
-    const withdrawAmount = parseFloat(amount);
-
-    // 🔍 Buscar al usuario en la BD incluyendo su rol y tier
-    const clientResult = await pool.query(
-      'SELECT id, balance, role, tier FROM users WHERE phone_number = $1',
-      [targetPhone]
+    // Buscar cliente/comercio por teléfono normalizado
+    const clientLookup = await client.query(
+      `SELECT id, balance, role, tier, full_name, phone_number
+       FROM users
+       WHERE REGEXP_REPLACE(COALESCE(phone_number, ''), '\\D', '', 'g') = $1`,
+      [cleanPhone]
     );
 
-    if (clientResult.rows.length === 0) {
+    if (clientLookup.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ success: false, error: "Cliente o Comercio no encontrado" });
     }
 
-    const client = clientResult.rows[0];
-    const client_id = client.id;
-    const userRole = String(client.role || '').toUpperCase();
-    const currentBalance = parseFloat(client.balance || 0);
+    const targetId = String(clientLookup.rows[0].id);
+    const agentStrId = String(agent_id);
 
-    // 🚀 LÓGICA DE COMISIÓN INTELIGENTE:
-    // Si el usuario es COMERCIO (MERCHANT), NO le cobramos comisión (comisión = 0)
-    // Si es CLIENTE (CLIENT), mantiene el cálculo de comisión habitual.
+    // Bloquear en orden determinista para prevenir deadlocks
+    const idsToLock = Array.from(new Set([targetId, agentStrId])).sort((a, b) => a.localeCompare(b));
+    const lockedMap = new Map();
+
+    for (const idItem of idsToLock) {
+      const uRes = await client.query(
+        'SELECT id, balance, role, tier, full_name, phone_number FROM users WHERE id::text = $1::text FOR UPDATE',
+        [idItem]
+      );
+      if (uRes.rows.length > 0) {
+        lockedMap.set(idItem, uRes.rows[0]);
+      }
+    }
+
+    const targetUser = lockedMap.get(targetId);
+    const agentUser = lockedMap.get(agentStrId);
+
+    if (!targetUser || !agentUser) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: "Usuario o agente no encontrado" });
+    }
+
+    const userRole = String(targetUser.role || '').toUpperCase();
+    const currentBalance = round2(parseFloat(targetUser.balance || 0));
+
     let comisiones;
     let totalDescuentoCliente;
 
     if (userRole === 'MERCHANT' || userRole === 'COMERCIO') {
       comisiones = {
+        montoRetiro: withdrawAmount,
         comisionTotal: 0.00,
         comisionAgente: 0.00,
         comisionTiolito: 0.00
       };
-      totalDescuentoCliente = withdrawAmount; // Descuento 1:1 sin recargo
+      totalDescuentoCliente = withdrawAmount;
     } else {
-      comisiones = calcularYDividirComision(withdrawAmount);
-      totalDescuentoCliente = withdrawAmount + comisiones.comisionTotal;
+      comisiones = {
+        montoRetiro: withdrawAmount,
+        comisionTotal: round2(comisionesBase.comisionTotal),
+        comisionAgente: round2(comisionesBase.comisionAgente),
+        comisionTiolito: round2(comisionesBase.comisionTiolito)
+      };
+      totalDescuentoCliente = round2(withdrawAmount + comisiones.comisionTotal);
     }
 
-    // Validar que tenga suficiente saldo
     if (currentBalance < totalDescuentoCliente) {
+      await client.query('ROLLBACK');
       const errorMsg = (userRole === 'MERCHANT' || userRole === 'COMERCIO')
         ? `Saldo insuficiente. Tu saldo disponible es de Q${currentBalance.toFixed(2)}.`
         : `Saldo insuficiente. Necesitas Q${totalDescuentoCliente.toFixed(2)} (incluye Q${comisiones.comisionTotal.toFixed(2)} de comisión)`;
@@ -1120,89 +1012,103 @@ app.post('/api/cash-out', verifyToken, requireRole('AGENT'), validarLimitesAML, 
       return res.status(400).json({ success: false, error: errorMsg });
     }
 
-    const newBalance = currentBalance - totalDescuentoCliente;
+    // Si viene código de retiro, validar y bloquear dentro de la transacción
+    if (code) {
+      const codeCheck = await client.query(
+        `SELECT id, client_id, amount, status, expires_at
+         FROM withdrawal_codes
+         WHERE code = $1
+         FOR UPDATE`,
+        [code]
+      );
 
-    // 1. Actualizar el saldo del cliente/comercio
-    await pool.query(
-      'UPDATE users SET balance = $1 WHERE id = $2',
-      [newBalance, client_id]
-    );
+      if (codeCheck.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, error: "Código de retiro inválido." });
+      }
 
-    // 2. Actualizar el saldo del agente (Se le entrega el monto del retiro + su % de comisión si aplicó)
-    const totalAbonoAgente = withdrawAmount + comisiones.comisionAgente;
-    await pool.query(
-      'UPDATE users SET balance = balance + $1 WHERE id = $2', 
-      [totalAbonoAgente, agent_id]
-    );
+      const codeRow = codeCheck.rows[0];
+      if (String(codeRow.status).toUpperCase() !== 'PENDING') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, error: "El código de retiro ya fue utilizado." });
+      }
 
-    await pool.query(
-      'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
-      [totalAbonoAgente, agent_id]
-    );
+      if (new Date(codeRow.expires_at) <= new Date()) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, error: "El código de retiro ha expirado." });
+      }
 
-    // 3. ABONAR AUTOMÁTICAMENTE EL % CORRESPONDIENTE A TIOLITO (Solo si hubo comisión)
-    if (comisiones.comisionTiolito > 0) {
-      try {
-        const adminResult = await pool.query(
-          "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
-        );
-
-        if (adminResult.rows.length > 0) {
-          const admin_id = adminResult.rows[0].id;
-
-          await pool.query(
-            'UPDATE users SET balance = balance + $1 WHERE id = $2',
-            [comisiones.comisionTiolito, admin_id]
-          );
-
-          try {
-            await pool.query(
-              'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
-              [comisiones.comisionTiolito, admin_id]
-            );
-          } catch (errWallet) {
-            // Ignora si no aplica wallet
-          }
-        }
-      } catch (adminErr) {
-        console.error("Error abonando comisión a administración:", adminErr.message);
+      if (String(codeRow.client_id) !== targetId) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, error: "El código de retiro no corresponde a este usuario." });
       }
     }
 
-    // 4. Generar folio único para el comprobante de Retiro
-    const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const newBalance = round2(currentBalance - totalDescuentoCliente);
+    const totalAbonoAgente = round2(withdrawAmount + comisiones.comisionAgente);
+    const newAgentBalance = round2(parseFloat(agentUser.balance || 0) + totalAbonoAgente);
 
-    const txResult = await pool.query(
-      "INSERT INTO transactions (agent_id, client_id, amount, type) VALUES ($1, $2, $3, 'CASH-OUT') RETURNING id, created_at",
-      [agent_id, client_id, withdrawAmount]
+    // 1. Actualizar saldo del cliente/comercio
+    await client.query(
+      'UPDATE users SET balance = $1 WHERE id::text = $2::text',
+      [newBalance, targetId]
+    );
+
+    // 2. Actualizar saldo del agente
+    await client.query(
+      'UPDATE users SET balance = $1 WHERE id::text = $2::text',
+      [newAgentBalance, agentStrId]
+    );
+    await client.query(
+      'UPDATE wallets SET balance = ROUND((balance + $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+      [totalAbonoAgente, agentStrId]
+    );
+
+    // 3. Abonar comisión a administración si hubo comisión
+    if (comisiones.comisionTiolito > 0) {
+      const adminResult = await client.query(
+        "SELECT id FROM users WHERE UPPER(role) = 'ADMIN' OR phone_number = '00000000' ORDER BY id ASC LIMIT 1 FOR UPDATE"
+      );
+
+      if (adminResult.rows.length > 0) {
+        const admin_id = String(adminResult.rows[0].id);
+        await client.query(
+          'UPDATE users SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2) WHERE id::text = $2::text',
+          [comisiones.comisionTiolito, admin_id]
+        );
+        await client.query(
+          'UPDATE wallets SET balance = ROUND((balance + $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+          [comisiones.comisionTiolito, admin_id]
+        );
+      }
+    }
+
+    // 4. Registrar transacción CASH-OUT y marcar código como usado
+    const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const txResult = await client.query(
+      `INSERT INTO transactions (agent_id, client_id, amount, type, created_at)
+       VALUES ($1, $2, $3, 'CASH-OUT', NOW())
+       RETURNING id, created_at`,
+      [agent_id, targetUser.id, withdrawAmount]
     );
     const transactionIdShort = txResult.rows[0].id;
 
-    const code = req.body.code;
     if (code) {
-      await pool.query(
+      await client.query(
         "UPDATE withdrawal_codes SET status = 'USED' WHERE code = $1",
         [code]
       );
     }
 
-    // Avisar al usuario en tiempo real sobre el retiro
-    io.to(`client_${client_id}`).emit('balance_updated', {
-        type: "Retiro (Cash-Out)",
-        amount: withdrawAmount,
-        commission: comisiones.comisionTotal,
-        created_at: new Date()
+    await client.query('COMMIT');
+
+    io.to(`client_${targetUser.id}`).emit('balance_updated', {
+      type: "Retiro (Cash-Out)",
+      amount: withdrawAmount,
+      commission: comisiones.comisionTotal,
+      created_at: new Date()
     });
 
-    // Consultar el nombre real del agente y del cliente
-    const agentInfoRes = await pool.query('SELECT full_name FROM users WHERE id = $1', [agent_id]);
-    const realAgentName = agentInfoRes.rows[0]?.full_name || agentName || 'Punto Agente Tiolito';
-
-    const clientInfoRes = await pool.query('SELECT full_name FROM users WHERE id::text = $1::text', [String(client_id)]);
-    const clientName = clientInfoRes.rows[0]?.full_name || 'Cliente';
-    const clientPhone = targetPhone;
-
-    // 5. Retornar la respuesta
     return res.json({
       success: true,
       new_balance: newBalance,
@@ -1211,19 +1117,26 @@ app.post('/api/cash-out', verifyToken, requireRole('AGENT'), validarLimitesAML, 
         id: transactionIdShort,
         folio: folioUnico,
         type: "Retiro (Cash-Out)",
-        agent_name: realAgentName,   
-        client_name: clientName,     
-        client_phone: clientPhone,   
+        agent_name: agentUser.full_name || agentNameFromToken,
+        client_name: targetUser.full_name || 'Cliente',
+        client_phone: targetUser.phone_number || cleanPhone,
         amount: withdrawAmount,
         commission: comisiones.comisionTotal,
         created_at: new Date()
       }
     });
   } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Error en ROLLBACK (cash-out):', rollbackErr);
+    }
     console.error("ERROR EN CASH-OUT:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({ success: false, error: "Error interno al procesar el retiro." });
+  } finally {
+    client.release();
   }
-}); 
+});
 
 // Ruta para validar un código o QR de retiro
 app.post('/api/cash-out/validate-code', verifyToken, requireRole('AGENT'), async (req, res) => {
@@ -1350,38 +1263,24 @@ app.post('/api/agent/register-client', verifyToken, requireRole('AGENT'), async 
     return res.json({ success: true, client: result.rows[0] });
   } catch (error) {
     console.error("ERROR AL REGISTRAR CLIENTE:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({ success: false, error: "Error interno al registrar al cliente" });
   }
 });
 
 // Obtener el saldo del agente
 app.get('/api/agent/balance', verifyToken, requireRole('AGENT'), async (req, res) => {
     try {
-        const authHeader = req.headers['authorization'];
-        if (!authHeader) {
-            
-            return res.status(401).json({ error: 'No token' });
-        }
-        
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, 'secreto_jwt');
-        
-        
-        const agent_id = decoded.id; 
-       
-
+        const agent_id = req.user.id;
         const result = await pool.query('SELECT balance FROM users WHERE id = $1', [agent_id]);
-        
-        
+
         if (result.rows.length > 0) {
             return res.json({ balance: result.rows[0].balance });
         } else {
-            
             return res.status(404).json({ error: 'Billetera no encontrada' });
         }
     } catch (error) {
-        console.error("ERROR DETALLADO EN /api/agent/balance:", error.message);
-        return res.status(500).json({ error: error.message });
+        console.error("ERROR DETALLADO EN /api/agent/balance:", error);
+        return res.status(500).json({ error: "Error interno al consultar el saldo del agente" });
     }
 });
 
@@ -1412,7 +1311,7 @@ app.get('/api/users/lookup/:phone', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error("ERROR AL BUSCAR CLIENTE:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({ success: false, error: "Error interno al buscar al cliente" });
   }
 });
 
@@ -1439,92 +1338,103 @@ app.post('/api/consult-client', verifyToken, requireRole('AGENT', 'ADMIN'), asyn
 // Ruta para realizar el Corte de Caja (Cierre de Turno)
 // Ruta para realizar el Corte de Caja (Cierre de Turno Dinámico)
 app.post('/api/cierre-caja', verifyToken, requireRole('AGENT'), async (req, res) => {
-  try {
+    const agentId = req.user.id;
     const { efectivo_fisico, fondo_inicial = 0 } = req.body;
 
-    // Capturar agente desde el token
-    let agent_id = 1;
-    const authHeader = req.headers['authorization'];
-    if (authHeader) {
-      try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, 'secreto_jwt');
-        agent_id = decoded.id || decoded.userId || 1;
-      } catch (e) {
-        console.log("Error decodificando token en cierre de caja:", e.message);
-      }
+    if (efectivo_fisico === undefined || efectivo_fisico === null || isNaN(parseFloat(efectivo_fisico))) {
+        return res.status(400).json({ success: false, error: 'Ingresa una cantidad válida de efectivo físico.' });
     }
 
-    if (efectivo_fisico === undefined || efectivo_fisico === null) {
-      return res.status(400).json({ error: 'Ingresa la cantidad de efectivo físico.' });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Bloquear fila del agente para evitar cortes concurrentes duplicados
+        const agentLock = await client.query(
+            'SELECT id FROM users WHERE id::text = $1::text FOR UPDATE',
+            [String(agentId)]
+        );
+        if (agentLock.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Agente no encontrado.' });
+        }
+
+        // 1. Obtener la fecha del último corte registrado de este agente
+        const ultimoCorteResult = await client.query(
+            'SELECT created_at FROM caja_cortes WHERE agent_id::text = $1::text ORDER BY created_at DESC LIMIT 1',
+            [String(agentId)]
+        );
+
+        const fechaUltimoCorte = ultimoCorteResult.rows.length > 0
+            ? ultimoCorteResult.rows[0].created_at
+            : '1970-01-01 00:00:00';
+
+        // 2. Calcular Total Cash-In desde el último corte
+        const cashInQuery = `
+            SELECT COALESCE(SUM(amount), 0) AS total_cash_in
+            FROM transactions
+            WHERE agent_id::text = $1::text
+              AND LOWER(type) IN ('cash_in', 'cash-in', 'deposit', 'deposito', 'ingreso')
+              AND created_at > $2
+        `;
+        const cashInResult = await client.query(cashInQuery, [String(agentId), fechaUltimoCorte]);
+        const totalCashIn = round2(parseFloat(cashInResult.rows[0].total_cash_in || 0));
+
+        // 3. Calcular Total Cash-Out desde el último corte
+        const cashOutQuery = `
+            SELECT COALESCE(SUM(amount), 0) AS total_cash_out
+            FROM transactions
+            WHERE agent_id::text = $1::text
+              AND LOWER(type) IN ('cash_out', 'cash-out', 'withdrawal', 'retiro')
+              AND created_at > $2
+        `;
+        const cashOutResult = await client.query(cashOutQuery, [String(agentId), fechaUltimoCorte]);
+        const totalCashOut = round2(parseFloat(cashOutResult.rows[0].total_cash_out || 0));
+
+        // 4. Cálculos matemáticos del corte
+        const fondoInicialNum = round2(parseFloat(fondo_inicial) || 0);
+        const efectivoEsperado = round2(fondoInicialNum + totalCashIn - totalCashOut);
+        const efectivoFisicoNum = round2(parseFloat(efectivo_fisico));
+        const diferencia = round2(efectivoFisicoNum - efectivoEsperado);
+
+        let estado = 'Cuadrado';
+        if (diferencia > 0) estado = `Sobrante (+Q${diferencia.toFixed(2)})`;
+        if (diferencia < 0) estado = `Faltante (-Q${Math.abs(diferencia).toFixed(2)})`;
+
+        // 5. Guardar este corte de caja en la base de datos
+        await client.query(
+            `INSERT INTO caja_cortes 
+             (agent_id, fondo_inicial, total_cash_in, total_cash_out, efectivo_esperado, efectivo_fisico, diferencia, estado)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [agentId, fondoInicialNum, totalCashIn, totalCashOut, efectivoEsperado, efectivoFisicoNum, diferencia, estado]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            fondo_inicial: fondoInicialNum.toFixed(2),
+            total_cash_in: totalCashIn.toFixed(2),
+            total_cash_out: totalCashOut.toFixed(2),
+            efectivo_esperado: efectivoEsperado.toFixed(2),
+            efectivo_fisico: efectivoFisicoNum.toFixed(2),
+            diferencia: diferencia.toFixed(2),
+            estado: estado
+        });
+
+    } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (cierre-caja):', rollbackErr);
+        }
+        console.error('Error en el corte de caja:', error);
+        return res.status(500).json({ success: false, error: 'Error interno al procesar el corte de caja' });
+    } finally {
+        client.release();
     }
-
-    // 1. Obtener la fecha del último corte registrado de este agente
-    const ultimoCorteResult = await pool.query(
-      'SELECT created_at FROM caja_cortes WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 1',
-      [agent_id]
-    );
-
-    const fechaUltimoCorte = ultimoCorteResult.rows.length > 0 
-      ? ultimoCorteResult.rows[0].created_at 
-      : '1970-01-01 00:00:00'; // Si nunca ha hecho corte, toma desde el inicio
-
-    // 2. Calcular Total Cash-In desde el último corte
-    const cashInQuery = `
-      SELECT COALESCE(SUM(amount), 0) AS total_cash_in
-      FROM transactions
-      WHERE agent_id = $1
-        AND LOWER(type) IN ('cash_in', 'cash-in', 'deposit', 'deposito', 'ingreso')
-        AND created_at > $2
-    `;
-    const cashInResult = await pool.query(cashInQuery, [agent_id, fechaUltimoCorte]);
-    const totalCashIn = parseFloat(cashInResult.rows[0].total_cash_in);
-
-    // 3. Calcular Total Cash-Out desde el último corte
-    const cashOutQuery = `
-      SELECT COALESCE(SUM(amount), 0) AS total_cash_out
-      FROM transactions
-      WHERE agent_id = $1
-        AND LOWER(type) IN ('cash_out', 'cash-out', 'withdrawal', 'retiro')
-        AND created_at > $2
-    `;
-    const cashOutResult = await pool.query(cashOutQuery, [agent_id, fechaUltimoCorte]);
-    const totalCashOut = parseFloat(cashOutResult.rows[0].total_cash_out);
-
-    // 4. Cálculos matemáticos del corte
-    const fondoInicialNum = parseFloat(fondo_inicial) || 0;
-    const efectivoEsperado = fondoInicialNum + totalCashIn - totalCashOut;
-    const efectivoFisicoNum = parseFloat(efectivo_fisico);
-    const diferencia = efectivoFisicoNum - efectivoEsperado;
-
-    let estado = 'Cuadrado';
-    if (diferencia > 0) estado = `Sobrante (+Q${diferencia.toFixed(2)})`;
-    if (diferencia < 0) estado = `Faltante (-Q${Math.abs(diferencia).toFixed(2)})`;
-
-    // 5. Guardar este corte de caja en la base de datos
-    await pool.query(
-      `INSERT INTO caja_cortes 
-       (agent_id, fondo_inicial, total_cash_in, total_cash_out, efectivo_esperado, efectivo_fisico, diferencia, estado)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [agent_id, fondoInicialNum, totalCashIn, totalCashOut, efectivoEsperado, efectivoFisicoNum, diferencia, estado]
-    );
-
-    // 6. Retornar respuesta al cliente
-    res.json({
-      fondo_inicial: fondoInicialNum.toFixed(2),
-      total_cash_in: totalCashIn.toFixed(2),
-      total_cash_out: totalCashOut.toFixed(2),
-      efectivo_esperado: efectivoEsperado.toFixed(2),
-      efectivo_fisico: efectivoFisicoNum.toFixed(2),
-      diferencia: diferencia.toFixed(2),
-      estado: estado
-    });
-
-  } catch (error) {
-    console.error('Error en el corte de caja:', error);
-    res.status(500).json({ error: 'Error interno al procesar el corte de caja' });
-  }
 });
+
 // ==========================================
 // ENDPOINT: POST /api/client/request-withdrawal (Cliente solicita retiro con código)
 // ==========================================
@@ -1820,7 +1730,7 @@ app.get('/api/merchant/balance', verifyToken, requireRole('MERCHANT', 'COMERCIO'
         res.json({ success: true, balance: result.rows[0].balance || '0.00' });
     } catch (error) {
         console.error("Error al obtener saldo del comercio:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al obtener el saldo del comercio" });
     }
 });
 
@@ -1853,7 +1763,7 @@ app.post('/api/merchant/generate-charge', verifyToken, requireRole('MERCHANT', '
         });
     } catch (error) {
         console.error("Error al generar orden de cobro:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al generar una orden de cobro" });
     }
 });
 
@@ -1944,7 +1854,7 @@ app.get('/api/merchant/transactions', verifyToken, requireRole('MERCHANT', 'COME
 
     } catch (error) {
         console.error("Error al cargar transacciones detalladas del comercio:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al cargar las transacciones del comercio" });
     }
 });
 
@@ -2061,7 +1971,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
 
         // 8. Acreditar el 100% de la comisión a Tiolito Admin automáticamente
         const adminRes = await client.query(
-            "SELECT id FROM users WHERE role = 'admin' OR phone_number = '00000000' LIMIT 1"
+            "SELECT id FROM users WHERE role = 'ADMIN' OR phone_number = '00000000' LIMIT 1"
         );
         if (adminRes.rows.length > 0) {
             const adminId = adminRes.rows[0].id;
@@ -2116,7 +2026,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error al procesar pago a comercio:', error);
-        return res.status(500).json({ success: false, error: error.message || 'Error al procesar el pago' });
+        return res.status(500).json({ success: false, error: 'Error al procesar el pago' });
     } finally {
         client.release();
     }
@@ -2211,7 +2121,7 @@ app.post('/api/merchant/withdraw-agent', verifyToken, requireRole('MERCHANT', 'C
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error al generar retiro en agente:', error);
-        return res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: "Error interno al generar el codigo de retiro" });
     } finally {
         client.release();
     }
@@ -2225,7 +2135,7 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
     const merchantId = req.user.id;
     const { amount, bank_name, account_number, account_type } = req.body;
 
-    const withdrawAmount = parseFloat(amount);
+    const withdrawAmount = round2(parseFloat(amount));
     if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
         return res.status(400).json({ success: false, error: 'Monto de retiro inválido.' });
     }
@@ -2238,10 +2148,10 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
     try {
         await client.query('BEGIN');
 
-        // 1. Obtener datos del comercio usando 'tier' y 'full_name'
+        // 1. Bloquear fila del comercio y obtener datos
         const merchantRes = await client.query(
-            'SELECT id, balance, tier, full_name FROM users WHERE id = $1 FOR UPDATE',
-            [merchantId]
+            'SELECT id, balance, tier, full_name FROM users WHERE id::text = $1::text FOR UPDATE',
+            [String(merchantId)]
         );
 
         if (merchantRes.rows.length === 0) {
@@ -2252,7 +2162,7 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
         const merchant = merchantRes.rows[0];
         const merchantTier = Number(merchant.tier || 1);
 
-        // 🛡️ Regla de negocio: Monto mínimo para ACH en Comercios Pequeños (Tier 1)
+        // Regla de negocio: Monto mínimo para ACH en Comercios Pequeños (Tier 1)
         const MINIMO_ACH_SMALL = 500.00;
         if (merchantTier === 1 && withdrawAmount < MINIMO_ACH_SMALL) {
             await client.query('ROLLBACK');
@@ -2262,8 +2172,7 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
             });
         }
 
-        // Validar saldo suficiente
-        const currentBalance = parseFloat(merchant.balance || 0);
+        const currentBalance = round2(parseFloat(merchant.balance || 0));
         if (currentBalance < withdrawAmount) {
             await client.query('ROLLBACK');
             return res.status(400).json({
@@ -2272,16 +2181,19 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
             });
         }
 
-        // 2. Descontar ÚNICAMENTE el monto exacto del retiro (Sin comisión)
-        await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [withdrawAmount, merchantId]);
+        // 2. Descontar el monto exacto del retiro
+        await client.query(
+            'UPDATE users SET balance = ROUND((balance - $1)::numeric, 2) WHERE id::text = $2::text',
+            [withdrawAmount, String(merchantId)]
+        );
 
-        // 3. Registrar la transacción en la tabla transactions para el historial (CORREGIDO)
+        // 3. Registrar la transacción en transactions
         const folioUnico = `ACH-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
         await client.query(
             `INSERT INTO transactions (client_id, amount, type, bank_name, account_number, account_type, created_at) 
              VALUES ($1, $2, 'BANK-WITHDRAWAL-PENDING', $3, $4, $5, NOW())`,
-            [merchantId, withdrawAmount, bank_name, account_number, account_type || 'Monetaria']
+            [String(merchantId), withdrawAmount, bank_name, account_number, account_type || 'Monetaria']
         );
 
         await client.query('COMMIT');
@@ -2301,9 +2213,13 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (merchant withdraw-bank):', rollbackErr);
+        }
         console.error('Error al procesar retiro bancario de comercio:', error);
-        return res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: 'Error interno al procesar la liquidación.' });
     } finally {
         client.release();
     }
@@ -2312,7 +2228,7 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
 // ==========================================
 // Endpoint para que el Admin vea las solicitudes ACH pendientes (Comercios y Agentes)
 // ==========================================
-app.get('/api/admin/bank-withdrawals', requireRole('ADMIN'), verifyToken, async (req, res) => {
+app.get('/api/admin/bank-withdrawals', verifyToken, requireRole('ADMIN'), async (req, res) => {
     try {
         const query = `
             SELECT 
@@ -2341,7 +2257,7 @@ app.get('/api/admin/bank-withdrawals', requireRole('ADMIN'), verifyToken, async 
 
     } catch (error) {
         console.error("Error al obtener solicitudes ACH:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al obtener las solicitudes ACH" });
     }
 });
 
@@ -2355,28 +2271,53 @@ app.post('/api/admin/complete-bank-withdrawal', verifyToken, requireRole('ADMIN'
         return res.status(400).json({ success: false, error: 'ID de transacción requerido.' });
     }
 
+    const client = await pool.connect();
     try {
-        // Actualizamos a 'BANK-WITHDRAWAL-COMPLETED' sin importar si vino de un comercio o de un agente
-        const result = await pool.query(
-            `UPDATE transactions 
-             SET type = 'BANK-WITHDRAWAL-COMPLETED' 
-             WHERE id = $1 AND UPPER(type) IN ('BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING') 
-             RETURNING id`,
-            [transaction_id]
+        await client.query('BEGIN');
+
+        // Bloquear la transacción pendiente para evitar doble procesamiento
+        const txCheck = await client.query(
+            `SELECT id, type FROM transactions
+             WHERE id::text = $1::text
+             FOR UPDATE`,
+            [String(transaction_id)]
         );
 
-        if (result.rowCount === 0) {
-            return res.status(404).json({ success: false, error: 'Transacción no encontrada o ya procesada.' });
+        if (txCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Transacción no encontrada.' });
         }
 
-        res.json({ 
-            success: true, 
-            message: 'Liquidación marcada como completada con éxito.' 
+        const currentType = String(txCheck.rows[0].type || '').toUpperCase();
+        if (!['BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING'].includes(currentType)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, error: 'La transacción ya fue procesada o no es un retiro pendiente.' });
+        }
+
+        await client.query(
+            `UPDATE transactions 
+             SET type = 'BANK-WITHDRAWAL-COMPLETED' 
+             WHERE id::text = $1::text`,
+            [String(transaction_id)]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            message: 'Liquidación marcada como completada con éxito.'
         });
 
     } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (complete-bank-withdrawal):', rollbackErr);
+        }
         console.error("Error al completar liquidación ACH:", error);
-        res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: 'Error interno al completar la liquidación.' });
+    } finally {
+        client.release();
     }
 });
 
@@ -2422,7 +2363,7 @@ app.get('/api/admin/bank-withdrawals-history', verifyToken, requireRole('ADMIN')
 // ==========================================
 app.get('/api/admin/balance', verifyToken, requireRole('ADMIN'), async (req, res) => {
     // Opcional: Validar que el usuario que hace la petición realmente sea 'admin'
-    if (req.user.role !== 'admin') {
+    if (req.user.role !== 'ADMIN') {
         return res.status(403).json({ success: false, error: 'Acceso denegado. Se requiere rol de administrador.' });
     }
 
@@ -2460,7 +2401,7 @@ app.post('/api/agent/withdraw-bank', verifyToken, requireRole('AGENT'), async (r
     const userId = req.user.id;
     const { amount, bank_name, account_number, account_type } = req.body;
 
-    const withdrawAmount = parseFloat(amount);
+    const withdrawAmount = round2(parseFloat(amount));
     if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
         return res.status(400).json({ success: false, error: 'Monto de retiro inválido.' });
     }
@@ -2473,7 +2414,7 @@ app.post('/api/agent/withdraw-bank', verifyToken, requireRole('AGENT'), async (r
     try {
         await client.query('BEGIN');
 
-        // 1. Verificar que el usuario exista y sea Agente (Validación estricta de rol)
+        // 1. Bloquear y verificar que el usuario exista
         const userRes = await client.query(
             'SELECT id, balance, role, full_name FROM users WHERE id::text = $1::text FOR UPDATE',
             [String(userId)]
@@ -2485,11 +2426,7 @@ app.post('/api/agent/withdraw-bank', verifyToken, requireRole('AGENT'), async (r
         }
 
         const userData = userRes.rows[0];
-        
-        // Opcional: Validar que el rol sea agente (si usas 'AGENT' o 'PUNTO-AGENTE')
-        // if (userData.role !== 'AGENT' && userData.role !== 'PUNTO-AGENTE') { ... }
-
-        const currentBalance = parseFloat(userData.balance || 0);
+        const currentBalance = round2(parseFloat(userData.balance || 0));
 
         if (currentBalance < withdrawAmount) {
             await client.query('ROLLBACK');
@@ -2499,13 +2436,23 @@ app.post('/api/agent/withdraw-bank', verifyToken, requireRole('AGENT'), async (r
             });
         }
 
-        // 2. Descontar el saldo del agente
-        await client.query('UPDATE users SET balance = balance - $1 WHERE id::text = $2::text', [withdrawAmount, String(userId)]);
-        try {
-            await client.query('UPDATE wallets SET balance = balance - $1 WHERE user_id::text = $2::text', [withdrawAmount, String(userId)]);
-        } catch (eWallet) {}
+        // Bloquear wallet si existe fila para este usuario
+        await client.query(
+            'SELECT id FROM wallets WHERE user_id::text = $1::text FOR UPDATE',
+            [String(userId)]
+        );
 
-        // 3. Registrar la transacción con un tipo específico para el panel de administración
+        // 2. Descontar el saldo del agente
+        await client.query(
+            'UPDATE users SET balance = ROUND((balance - $1)::numeric, 2) WHERE id::text = $2::text',
+            [withdrawAmount, String(userId)]
+        );
+        await client.query(
+            'UPDATE wallets SET balance = ROUND((balance - $1)::numeric, 2) WHERE user_id::text = $2::text',
+            [withdrawAmount, String(userId)]
+        );
+
+        // 3. Registrar la transacción pendiente para administración
         const folioUnico = `ACH-AGT-${Date.now().toString().slice(-6)}`;
 
         await client.query(
@@ -2524,9 +2471,13 @@ app.post('/api/agent/withdraw-bank', verifyToken, requireRole('AGENT'), async (r
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (agent withdraw-bank):', rollbackErr);
+        }
         console.error('Error en retiro de agente:', error);
-        return res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: 'Error interno al procesar el retiro.' });
     } finally {
         client.release();
     }
@@ -2560,55 +2511,80 @@ app.get('/api/user/withdrawals', verifyToken, async (req, res) => {
         });
     } catch (error) {
         console.error("Error al obtener retiros del usuario:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error interno al obtener los retiros" });
     }
 });
 
 // ==========================================
-// Endpoint para cancelar solicitud de retiro (Comercios y Agentes)
+// CANCELAR SOLICITUD DE RETIRO ACH (Comercios y Agentes)
 // ==========================================
 app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
-    const userId = req.user?.id || req.user?.userId;
-    const withdrawalId = req.params.id;
+  const userId = String(req.user?.id || req.user?.userId || '');
+  const withdrawalId = String(req.params.id || '').trim();
 
-    try {
-        // 1. Buscar la solicitud pendiente en la base de datos
-        const checkQuery = `
-            SELECT id, amount, type 
-            FROM transactions 
-            WHERE id = $1 
-            AND (client_id::text = $2::text OR merchant_id::text = $2::text OR agent_id::text = $2::text)
-            AND UPPER(type) IN ('BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING')
-        `;
-        const checkResult = await pool.query(checkQuery, [withdrawalId, String(userId)]);
+  if (!userId || !withdrawalId) {
+    return res.status(400).json({ success: false, error: 'Solicitud inválida.' });
+  }
 
-        if (checkResult.rowCount === 0) {
-            return res.status(404).json({ 
-                success: false, 
-                error: 'No se encontró la solicitud pendiente o ya fue procesada.' 
-            });
-        }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-        const withdrawalAmount = checkResult.rows[0].amount;
-
-        // 2. Eliminar la solicitud de la tabla transactions
-        await pool.query(`DELETE FROM transactions WHERE id = $1`, [withdrawalId]);
-
-        // 3. Devolver el saldo al usuario sumándoselo a su balance
-        await pool.query(
-            `UPDATE users SET balance = balance + $1 WHERE id::text = $2::text`,
-            [withdrawalAmount, String(userId)]
-        );
-
-        res.json({
-            success: true,
-            message: 'Solicitud cancelada y saldo devuelto con éxito.'
-        });
-
-    } catch (error) {
-        console.error("Error al cancelar retiro:", error);
-        res.status(500).json({ success: false, error: 'Error interno al cancelar la solicitud.' });
+    // Bloquear fila del usuario primero para mantener orden consistente
+    const userRes = await client.query(
+      'SELECT id, balance FROM users WHERE id::text = $1::text FOR UPDATE',
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
     }
+
+    // Bloquear la solicitud pendiente
+    const checkQuery = `
+      SELECT id, amount, type
+      FROM transactions
+      WHERE id::text = $1::text
+        AND (client_id::text = $2::text OR merchant_id::text = $2::text OR agent_id::text = $2::text)
+        AND UPPER(type) IN ('BANK-WITHDRAWAL-PENDING', 'AGENT-BANK-WITHDRAWAL-PENDING')
+      FOR UPDATE
+    `;
+    const checkResult = await client.query(checkQuery, [withdrawalId, userId]);
+
+    if (checkResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        error: 'No se encontró la solicitud pendiente o ya fue procesada.'
+      });
+    }
+
+    const withdrawalAmount = round2(parseFloat(checkResult.rows[0].amount || 0));
+
+    await client.query('DELETE FROM transactions WHERE id::text = $1::text', [withdrawalId]);
+
+    await client.query(
+      'UPDATE users SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2) WHERE id::text = $2::text',
+      [withdrawalAmount, userId]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      message: 'Solicitud cancelada y saldo devuelto con éxito.'
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Error en ROLLBACK (delete withdrawal):', rollbackErr);
+    }
+    console.error("Error al cancelar retiro:", error);
+    return res.status(500).json({ success: false, error: 'Error interno al cancelar la solicitud.' });
+  } finally {
+    client.release();
+  }
 });
 
 // ==========================================
@@ -2682,14 +2658,13 @@ app.post('/api/auth/verify-code', async (req, res) => {
     }
 
     const user = userRes.rows[0];
-
-    // Marcar como verificado y limpiar el código temporal
-    await pool.query(
-      'UPDATE users SET is_verified = TRUE, verification_code = NULL WHERE id = $1',
-      [user.id]
-    );
-
     const token = jwt.sign({ id: user.id, role: user.role, name: user.full_name }, JWT_SECRET, { expiresIn: '2h' });
+
+    // Marcar como verificado, limpiar código y establecer sesión activa
+    await pool.query(
+      'UPDATE users SET is_verified = TRUE, verification_code = NULL, active_token = $1 WHERE id = $2',
+      [token, user.id]
+    );
 
     res.json({
       success: true,
