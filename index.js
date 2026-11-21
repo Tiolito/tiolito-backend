@@ -139,9 +139,27 @@ const verifyToken = async (req, res, next) => {
 };
 
 // ==========================================
+// MIDDLEWARE: Validar Rol Autorizado
+// ==========================================
+const requireRole = (...allowedRoles) => {
+    const normalizedAllowed = allowedRoles.map(r => String(r).toUpperCase());
+
+    return (req, res, next) => {
+        const userRole = String(req.user?.role || '').toUpperCase();
+        if (!userRole || !normalizedAllowed.includes(userRole)) {
+            return res.status(403).json({
+                success: false,
+                error: 'Acceso denegado. No tienes permisos para realizar esta operación.'
+            });
+        }
+        next();
+    };
+};
+
+// ==========================================
 // 3. ENDPOINT: GET /api/wallets/:user_id
 // ========================================== 
-app.get('/api/wallets/:user_id', async (req, res) => {
+app.get('/api/wallets/:user_id', verifyToken, async (req, res) => {
     const { user_id } = req.params;
 
     try {
@@ -212,47 +230,10 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.post('/api/register', async (req, res) => {
-  const { phone_number, pin, full_name, role } = req.body;
-
-  if (!phone_number || !pin) {
-    return res.status(400).json({ success: false, error: "Teléfono y PIN son obligatorios" });
-  }
-
-  try {
-    const salt = await bcrypt.genSalt(10);
-    const pin_hash = await bcrypt.hash(pin, salt); 
-    const userRole = 'CLIENT';
-
-    const result = await pool.query(
-      `INSERT INTO users (phone_number, pin_hash, full_name, role, balance) 
-       VALUES ($1, $2, $3, $4, $5) 
-       RETURNING id, phone_number, role`,
-      [phone_number, pin_hash, full_name || 'Usuario', userRole, 0.00]
-    );
-
-    const user = result.rows[0];
-    const token = jwt.sign({ userId: user.id, role: user.role }, 'secreto_jwt');
-
-    return res.json({
-      success: true,
-      token,
-      role: user.role,
-      message: 'Usuario registrado exitosamente'
-    });
-  } catch (error) {
-    console.error("ERROR EN EL REGISTRO:", error);
-    if (error.code === '23505') {
-      return res.status(400).json({ success: false, error: "El número ya está registrado" });
-    }
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // ==========================================
 // 4. ENDPOINT: GET /api/transactions/:user_id
 // ==========================================
-app.get('/api/transactions/:user_id', async (req, res) => {
+app.get('/api/transactions/:user_id', verifyToken, async (req, res) => {
     const { user_id } = req.params;
 
     try {
@@ -641,7 +622,7 @@ const transactionResult = await client.query(
 // ==========================================
 // 8. ENDPOINT: POST /api/merchant/refund (Reversión de cobros)
 // ==========================================
-app.post('/api/merchant/refund', verifyToken, async (req, res) => {
+app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     const { transaction_id } = req.body;
     const merchantId = req.user.id;
     
@@ -863,7 +844,7 @@ app.post('/api/agent/deposit', verifyToken, async (req, res) => {
 // ==========================================
 // ENDPOINT: GET /api/agent/transactions (Historial de transacciones del agente)
 // ==========================================
-app.get('/api/agent/transactions', verifyToken, async (req, res) => {
+app.get('/api/agent/transactions', verifyToken, requireRole('AGENT'), async (req, res) => {
   const agent_id = req.user?.id || req.user?.userId;
   
   if (!agent_id) {
@@ -921,7 +902,7 @@ app.get('/api/agent/transactions', verifyToken, async (req, res) => {
   }
 });
 
-app.post('/api/cash-in', verifyToken, validarLimitesAML, async (req, res) => {
+app.post('/api/cash-in', verifyToken, requireRole('AGENT'), validarLimitesAML, async (req, res) => {
   try {
     const targetPhone = req.body.phone_number || req.body.client_phone || req.body.phone;
     const amount = req.body.amount || req.body.monto;
@@ -1064,7 +1045,7 @@ function calcularYDividirComision(montoRetiro) {
     };
 }
 
-app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
+app.post('/api/cash-out', verifyToken, requireRole('AGENT'), validarLimitesAML, async (req, res) => {
   try {
     const targetPhone = req.body.client_phone || req.body.phone || req.body.phoneNumber || req.body.phone_number;
     const amount = req.body.amount || req.body.monto;
@@ -1245,7 +1226,7 @@ app.post('/api/cash-out', verifyToken, validarLimitesAML, async (req, res) => {
 }); 
 
 // Ruta para validar un código o QR de retiro
-app.post('/api/cash-out/validate-code', async (req, res) => {
+app.post('/api/cash-out/validate-code', verifyToken, requireRole('AGENT'), async (req, res) => {
   try {
     const { code } = req.body;
 
@@ -1288,7 +1269,7 @@ app.post('/api/cash-out/validate-code', async (req, res) => {
 }); 
 
 // Endpoint para Historial Detallado de Transacciones
-app.get('/api/transactions/history', async (req, res) => {
+app.get('/api/transactions/history', verifyToken, requireRole('ADMIN', 'AGENT'), async (req, res) => {
   try {
     const { agent_id, search, type, date } = req.query;
 
@@ -1343,7 +1324,7 @@ app.get('/api/transactions/history', async (req, res) => {
   }
 });
 
-app.post('/api/agent/register-client', async (req, res) => {
+app.post('/api/agent/register-client', verifyToken, requireRole('AGENT'), async (req, res) => {
   try {
     const { phone_number, full_name, pin } = req.body;
 
@@ -1374,7 +1355,7 @@ app.post('/api/agent/register-client', async (req, res) => {
 });
 
 // Obtener el saldo del agente
-app.get('/api/agent/balance', async (req, res) => {
+app.get('/api/agent/balance', verifyToken, requireRole('AGENT'), async (req, res) => {
     try {
         const authHeader = req.headers['authorization'];
         if (!authHeader) {
@@ -1405,7 +1386,7 @@ app.get('/api/agent/balance', async (req, res) => {
 });
 
 // Buscar cliente por teléfono
-app.get('/api/users/lookup/:phone', async (req, res) => {
+app.get('/api/users/lookup/:phone', verifyToken, async (req, res) => {
   try {
     const { phone } = req.params;
 
@@ -1437,7 +1418,7 @@ app.get('/api/users/lookup/:phone', async (req, res) => {
 
 
 // Ruta para consultar el nombre del cliente por teléfono
-app.post('/api/consult-client', async (req, res) => {
+app.post('/api/consult-client', verifyToken, requireRole('AGENT', 'ADMIN'), async (req, res) => {
   try {
     const { phone_number } = req.body;
 
@@ -1457,7 +1438,7 @@ app.post('/api/consult-client', async (req, res) => {
 
 // Ruta para realizar el Corte de Caja (Cierre de Turno)
 // Ruta para realizar el Corte de Caja (Cierre de Turno Dinámico)
-app.post('/api/cierre-caja', async (req, res) => {
+app.post('/api/cierre-caja', verifyToken, requireRole('AGENT'), async (req, res) => {
   try {
     const { efectivo_fisico, fondo_inicial = 0 } = req.body;
 
@@ -1827,7 +1808,7 @@ async function validarLimitesAML(req, res, next) {
 // ==========================================
 
 // 1. Obtener saldo acumulado del comercio
-app.get('/api/merchant/balance', verifyToken, async (req, res) => {
+app.get('/api/merchant/balance', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     try {
         const merchantId = req.user.id;
         const result = await pool.query('SELECT balance FROM users WHERE id = $1', [merchantId]);
@@ -1847,7 +1828,7 @@ app.get('/api/merchant/balance', verifyToken, async (req, res) => {
 // Memoria temporal para los cobros activos (o guárdalos en tu base de datos)
 const activeCharges = {};
 
-app.post('/api/merchant/generate-charge', verifyToken, async (req, res) => {
+app.post('/api/merchant/generate-charge', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     try {
         const { amount } = req.body;
         const merchantId = req.user.id;
@@ -1879,7 +1860,7 @@ app.post('/api/merchant/generate-charge', verifyToken, async (req, res) => {
 // ==========================================
 // ENDPOINT: GET /api/merchant/daily-report (Corregido para UUID y Auth por Token)
 // ==========================================
-app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
+app.get('/api/merchant/daily-report', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
   try {
     const merchantId = req.user.id; // Obtenemos el ID directamente del token JWT de manera segura
 
@@ -1926,7 +1907,7 @@ app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
 // ==========================================
 // 3. Historial detallado del comercio (Ventas y Retiros)
 // ==========================================
-app.get('/api/merchant/transactions', verifyToken, async (req, res) => {
+app.get('/api/merchant/transactions', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     try {
         const merchantId = req.user.id;
         
@@ -2144,7 +2125,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
 // ==========================================
 // 1. RETIRO EN PUNTO AGENTE (Enfocado en Comercios Pequeños Tier 1)
 // ==========================================
-app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
+app.post('/api/merchant/withdraw-agent', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     const merchantId = req.user.id;
     const { amount } = req.body;
 
@@ -2240,7 +2221,7 @@ app.post('/api/merchant/withdraw-agent', verifyToken, async (req, res) => {
 // ==========================================
 // 2. SOLICITUD DE TRANSFERENCIA BANCARIA (ACH) (Comercios Tier 1 y Tier 2)
 // ==========================================
-app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
+app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     const merchantId = req.user.id;
     const { amount, bank_name, account_number, account_type } = req.body;
 
@@ -2331,7 +2312,7 @@ app.post('/api/merchant/withdraw-bank', verifyToken, async (req, res) => {
 // ==========================================
 // Endpoint para que el Admin vea las solicitudes ACH pendientes (Comercios y Agentes)
 // ==========================================
-app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
+app.get('/api/admin/bank-withdrawals', requireRole('ADMIN'), verifyToken, async (req, res) => {
     try {
         const query = `
             SELECT 
@@ -2367,7 +2348,7 @@ app.get('/api/admin/bank-withdrawals', verifyToken, async (req, res) => {
 // ==========================================
 // Endpoint para que el Admin marque una liquidación ACH como completada (Comercios y Agentes)
 // ==========================================
-app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) => {
+app.post('/api/admin/complete-bank-withdrawal', verifyToken, requireRole('ADMIN'), async (req, res) => {
     const { transaction_id } = req.body;
 
     if (!transaction_id) {
@@ -2402,7 +2383,7 @@ app.post('/api/admin/complete-bank-withdrawal', verifyToken, async (req, res) =>
 // ==========================================
 // Endpoint para que el Admin vea el Historial de Pagos ACH Completados (Comercios y Agentes)
 // ==========================================
-app.get('/api/admin/bank-withdrawals-history', verifyToken, async (req, res) => {
+app.get('/api/admin/bank-withdrawals-history', verifyToken, requireRole('ADMIN'), async (req, res) => {
     try {
         const query = `
             SELECT 
@@ -2432,14 +2413,14 @@ app.get('/api/admin/bank-withdrawals-history', verifyToken, async (req, res) => 
 
     } catch (error) {
         console.error("Error al obtener historial ACH:", error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Error al obtener el historial de retiros" });
     }
 });
 
 // ==========================================
 // ENDPOINT: GET /api/admin/balance (Obtener saldo del Administrador)
 // ==========================================
-app.get('/api/admin/balance', verifyToken, async (req, res) => {
+app.get('/api/admin/balance', verifyToken, requireRole('ADMIN'), async (req, res) => {
     // Opcional: Validar que el usuario que hace la petición realmente sea 'admin'
     if (req.user.role !== 'admin') {
         return res.status(403).json({ success: false, error: 'Acceso denegado. Se requiere rol de administrador.' });
@@ -2475,7 +2456,7 @@ app.get('/api/admin/balance', verifyToken, async (req, res) => {
 // ==========================================
 // ENDPOINT: POST /api/agent/withdraw-bank (Exclusivo para Agentes)
 // ==========================================
-app.post('/api/agent/withdraw-bank', verifyToken, async (req, res) => {
+app.post('/api/agent/withdraw-bank', verifyToken, requireRole('AGENT'), async (req, res) => {
     const userId = req.user.id;
     const { amount, bank_name, account_number, account_type } = req.body;
 
@@ -2633,8 +2614,10 @@ app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
 // ==========================================
 // 1. REGISTRO CON ENVÍO DE CÓDIGO DE VERIFICACIÓN
 // ==========================================
+const allowDevCodes = process.env.ALLOW_DEV_CODES === 'true';
+
 app.post('/api/register', async (req, res) => {
-  const { phone_number, pin, full_name, role } = req.body;
+  const { phone_number, pin, full_name } = req.body;
 
   if (!phone_number || !pin) {
     return res.status(400).json({ success: false, error: "Teléfono y PIN son obligatorios" });
@@ -2642,13 +2625,13 @@ app.post('/api/register', async (req, res) => {
 
   try {
     const salt = await bcrypt.genSalt(10);
-    const pin_hash = await bcrypt.hash(pin, salt); 
+    const pin_hash = await bcrypt.hash(pin, salt);
     const userRole = 'CLIENT';
 
     // Generar código aleatorio de 6 dígitos
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-    const result = await pool.query(
+    await pool.query(
       `INSERT INTO users (phone_number, pin_hash, full_name, role, balance, is_verified, verification_code) 
        VALUES ($1, $2, $3, $4, $5, FALSE, $6) 
        RETURNING id, phone_number, role`,
@@ -2671,14 +2654,14 @@ app.post('/api/register', async (req, res) => {
       success: true,
       requires_verification: true,
       message: 'Cuenta registrada. Ingresa el código de verificación.',
-      dev_code: verificationCode // 👈 Esto te devuelve el código en el JSON para probar sin costo
+      ...(allowDevCodes ? { dev_code: verificationCode } : {})
     });
   } catch (error) {
     console.error("ERROR EN EL REGISTRO:", error);
     if (error.code === '23505') {
       return res.status(400).json({ success: false, error: "El número ya está registrado" });
     }
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({ success: false, error: "Error interno al registrar la cuenta." });
   }
 });
 
@@ -2750,14 +2733,14 @@ app.post('/api/auth/forgot-password', async (req, res) => {
           });
         */
 
-        res.json({
+        return res.json({
             success: true,
             message: 'Código de recuperación generado.',
-            dev_code: resetCode // 👈 Código en JSON para pruebas locales
+            ...(process.env.ALLOW_DEV_CODES === 'true' ? { dev_code: resetCode } : {})
         });
     } catch (error) {
         console.error('Error en forgot-password:', error);
-        res.status(500).json({ success: false, error: 'Error interno del servidor.' });
+        return res.status(500).json({ success: false, error: 'Error interno del servidor.' });
     }
 });
 
@@ -2799,7 +2782,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 // ==========================================
 // ENDPOINT: GET /api/agent/commissions-summary (Ajustado a hora de Guatemala)
 // ==========================================
-app.get('/api/agent/commissions-summary', verifyToken, async (req, res) => {
+app.get('/api/agent/commissions-summary', verifyToken, requireRole('AGENT'), async (req, res) => {
     const agentId = req.user.id;
 
     try {
