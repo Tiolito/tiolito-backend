@@ -1782,23 +1782,23 @@ app.get('/api/merchant/daily-report', verifyToken, requireRole('MERCHANT', 'COME
     // Consulta de resumen diario utilizando conversión estricta ::text para UUIDs
     const summaryQuery = `
       SELECT 
-        COALESCE(SUM(amount), 0) as total_sales, 
-        COUNT(*) as total_transactions
+        COALESCE(SUM(amount), 0) AS total_sales, 
+        COUNT(*) AS total_transactions
       FROM transactions 
       WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) 
-      AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-      AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date;
+        AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
+        AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date;
     `;
     const summaryRes = await pool.query(summaryQuery, [String(merchantId)]);
 
-    // Consulta detallada de transacciones del día para el comercio
+    // Consulta detallada de transacciones del día para el comercio (misma regla de fecha que el resumen)
     const txQuery = `
-      SELECT t.*, u.full_name as client_name 
+      SELECT t.*, u.full_name AS client_name 
       FROM transactions t
       LEFT JOIN users u ON t.client_id::text = u.id::text
       WHERE (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text) 
-      AND UPPER(t.type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-      AND DATE(t.created_at) = CURRENT_DATE
+        AND UPPER(t.type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
+        AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
       ORDER BY t.created_at DESC;
     `;
     const txRes = await pool.query(txQuery, [String(merchantId)]);
