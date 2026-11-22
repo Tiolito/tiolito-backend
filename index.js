@@ -1771,10 +1771,6 @@ app.post('/api/merchant/generate-charge', verifyToken, requireRole('MERCHANT', '
 // ==========================================
 // ENDPOINT: GET /api/merchant/daily-report (UUID, Auth por Token y TZ Guatemala)
 // ==========================================
-const hasMerchantRole = (role) => {
-  const normalized = String(role || '').trim().toUpperCase();
-  return normalized === 'MERCHANT' || normalized === 'COMERCIO' || normalized.includes('MERCHANT') || normalized.includes('COMERCIO');
-};
 
 app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
   try {
