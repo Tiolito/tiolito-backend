@@ -1436,33 +1436,54 @@ app.post('/api/cierre-caja', verifyToken, requireRole('AGENT'), async (req, res)
 });
 
 // ==========================================
-// ENDPOINT: POST /api/client/request-withdrawal (Cliente solicita retiro con código)
+// ENDPOINT: POST /api/client/request-withdrawal (Cliente solicita retiro con código en Agente - Máx Q2,000)
 // ==========================================
 app.post('/api/client/request-withdrawal', verifyToken, async (req, res) => {
     const clientId = req.user.id;
-    const { amount } = req.body;
+    const rawAmount = parseFloat(req.body.amount);
+    const withdrawAmount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
 
-    if (!amount || parseFloat(amount) <= 0) {
+    if (Number.isNaN(withdrawAmount) || withdrawAmount <= 0) {
         return res.status(400).json({ success: false, error: "Monto inválido para el retiro" });
     }
+
+    // 🛡️ Tope unificado de Q2,000.00 en Punto Agente para Tier 1 y Tier 2
+    const MAX_RETIRO_AGENTE = 2000.00;
+    if (withdrawAmount > MAX_RETIRO_AGENTE) {
+        return res.status(400).json({
+            success: false,
+            error: `El límite máximo para retiro en efectivo en Punto Agente es de Q${MAX_RETIRO_AGENTE.toFixed(2)} por transacción. Si eres Cliente Tier 2 y deseas retirar un monto mayor, utiliza Transferencia Bancaria (ACH).`
+        });
+    }
+
+    let comisiones;
+    try {
+        comisiones = calcularYDividirComision(withdrawAmount);
+    } catch (err) {
+        return res.status(400).json({ success: false, error: err.message });
+    }
+
+    const totalRequerido = round2(withdrawAmount + comisiones.comisionTotal);
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // 1. Verificar saldo del cliente
+        // 1. Verificar saldo del cliente (incluyendo comisión)
         const userCheck = await client.query('SELECT balance FROM users WHERE id = $1 FOR UPDATE', [clientId]);
         if (userCheck.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, error: "Usuario no encontrado" });
         }
 
-        const currentBalance = parseFloat(userCheck.rows[0].balance || 0);
-        const withdrawAmount = parseFloat(amount);
+        const currentBalance = round2(parseFloat(userCheck.rows[0].balance || 0));
 
-        if (currentBalance < withdrawAmount) {
+        if (currentBalance < totalRequerido) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: "Saldo insuficiente para solicitar este retiro" });
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente. Necesitas Q${totalRequerido.toFixed(2)} (incluye Q${comisiones.comisionTotal.toFixed(2)} de comisión).`
+            });
         }
 
         // 2. Generar un código aleatorio de 6 dígitos
@@ -1478,16 +1499,135 @@ app.post('/api/client/request-withdrawal', verifyToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-        res.json({
+        return res.json({
             success: true,
             code: withdrawalCode,
-            message: "Código de retiro generado exitosamente"
+            commission: comisiones.comisionTotal,
+            total_deducted_on_cashout: totalRequerido,
+            message: "Código de retiro generado exitosamente (Válido por 30 min)."
         });
 
     } catch (error) {
         await client.query('ROLLBACK');
         console.error("Error al generar código de retiro:", error);
-        res.status(500).json({ success: false, error: "Error interno al procesar la solicitud" });
+        return res.status(500).json({ success: false, error: "Error interno al procesar la solicitud" });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// ENDPOINT: POST /api/client/withdraw-bank (Retiro Bancario ACH exclusivo Clientes Tier 2)
+// ==========================================
+app.post('/api/client/withdraw-bank', verifyToken, requireRole('CLIENT'), validarLimitesAML, async (req, res) => {
+    const clientId = String(req.user.id);
+    const { amount, bank_name, account_number, account_type } = req.body;
+
+    const rawAmount = parseFloat(amount);
+    const withdrawAmount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
+
+    if (Number.isNaN(withdrawAmount) || withdrawAmount <= 0) {
+        return res.status(400).json({ success: false, error: 'Monto de retiro inválido.' });
+    }
+
+    if (!bank_name || !String(bank_name).trim() || !account_number || !String(account_number).trim()) {
+        return res.status(400).json({ success: false, error: 'Proporciona el banco y el número de cuenta de destino.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Bloquear fila del cliente y verificar Tier 2
+        const userRes = await client.query(
+            'SELECT id, balance, tier, full_name FROM users WHERE id::text = $1::text FOR UPDATE',
+            [clientId]
+        );
+
+        if (userRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
+        }
+
+        const user = userRes.rows[0];
+        const userTier = Number(user.tier || 1);
+
+        if (userTier !== 2) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                success: false,
+                error: 'Los retiros por Transferencia Bancaria (ACH) están disponibles únicamente para clientes verificados Tier 2.'
+            });
+        }
+
+        // Opcional: monto mínimo para ACH de cliente (ej. Q500.00)
+        const MINIMO_ACH_CLIENT = 500.00;
+        if (withdrawAmount < MINIMO_ACH_CLIENT) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `El monto mínimo para solicitar Transferencia Bancaria (ACH) es de Q${MINIMO_ACH_CLIENT.toFixed(2)}. Para montos menores, retira en efectivo en un Punto Agente.`
+            });
+        }
+
+        const currentBalance = round2(parseFloat(user.balance || 0));
+        if (currentBalance < withdrawAmount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente. Tu saldo disponible es de Q${currentBalance.toFixed(2)}.`
+            });
+        }
+
+        // 2. Descontar saldo al cliente (y en wallets si tiene registro)
+        await client.query(
+            'UPDATE users SET balance = ROUND((balance - $1)::numeric, 2) WHERE id::text = $2::text',
+            [withdrawAmount, clientId]
+        );
+        await client.query(
+            'UPDATE wallets SET balance = ROUND((balance - $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+            [withdrawAmount, clientId]
+        );
+
+        // 3. Registrar la transacción pendiente para que aparezca en el panel Admin ACH
+        const folioUnico = `ACH-CLI-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+        await client.query(
+            `INSERT INTO transactions (client_id, amount, type, bank_name, account_number, account_type, created_at)
+             VALUES ($1, $2, 'BANK-WITHDRAWAL-PENDING', $3, $4, $5, NOW())`,
+            [
+                clientId,
+                withdrawAmount,
+                String(bank_name).trim(),
+                String(account_number).trim(),
+                String(account_type || 'Monetaria').trim()
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        console.log(`📌 NUEVO RETIRO BANCARIO CLIENTE TIER 2: ${user.full_name} solicita Q${withdrawAmount} a ${bank_name} No. ${account_number}`);
+
+        return res.json({
+            success: true,
+            folio: folioUnico,
+            amount: withdrawAmount,
+            detalles_cuenta: {
+                banco: String(bank_name).trim(),
+                cuenta: String(account_number).trim(),
+                tipo: String(account_type || 'Monetaria').trim()
+            },
+            message: 'Solicitud de transferencia bancaria (ACH) enviada con éxito. Se depositará a tu cuenta en horario hábil.'
+        });
+
+    } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (client withdraw-bank):', rollbackErr);
+        }
+        console.error('Error al procesar retiro bancario de cliente Tier 2:', error);
+        return res.status(500).json({ success: false, error: 'Error interno al procesar la solicitud bancaria.' });
     } finally {
         client.release();
     }
@@ -2661,8 +2801,13 @@ app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
 
     await client.query('DELETE FROM transactions WHERE id::text = $1::text', [withdrawalId]);
 
-    await client.query(
+   await client.query(
       'UPDATE users SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2) WHERE id::text = $2::text',
+      [withdrawalAmount, userId]
+    );
+
+    await client.query(
+      'UPDATE wallets SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
       [withdrawalAmount, userId]
     );
 
