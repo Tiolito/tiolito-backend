@@ -1782,7 +1782,6 @@ const hasMerchantRole = (role) => {
 // ENDPOINT: GET /api/merchant/daily-report (UUID, Auth por Token y TZ Guatemala)
 // ==========================================
 app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
-  console.log('📊 Entrando a /api/merchant/daily-report | user:', req.user);
   try {
     if (!hasMerchantRole(req.user?.role)) {
       return res.status(403).json({
