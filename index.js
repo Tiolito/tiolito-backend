@@ -1782,7 +1782,7 @@ const hasMerchantRole = (role) => {
 // ENDPOINT: GET /api/merchant/daily-report (UUID, Auth por Token y TZ Guatemala)
 // ==========================================
 app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
-    console.log('📊 Entrando a /api/merchant/daily-report | user:', req.user);
+  console.log('📊 Entrando a /api/merchant/daily-report | user:', req.user);
   try {
     if (!hasMerchantRole(req.user?.role)) {
       return res.status(403).json({
@@ -1803,8 +1803,8 @@ app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
     const filterClause = `
       (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text)
       AND UPPER(COALESCE(t.type, '')) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-      AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
-          (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+      AND (t.created_at AT TIME ZONE 'America/Guatemala')::date =
+          (NOW() AT TIME ZONE 'America/Guatemala')::date
     `;
 
     const summaryQuery = `
