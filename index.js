@@ -1769,49 +1769,69 @@ app.post('/api/merchant/generate-charge', verifyToken, requireRole('MERCHANT', '
 });
 
 // ==========================================
-// ENDPOINT: GET /api/merchant/daily-report (Corregido para UUID y Auth por Token)
+// ENDPOINT: GET /api/merchant/daily-report (UUID, Auth por Token y TZ Guatemala)
 // ==========================================
 app.get('/api/merchant/daily-report', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
   try {
-    const merchantId = req.user.id; // Obtenemos el ID directamente del token JWT de manera segura
+    const merchantId = String(req.user?.id || '').trim();
 
     if (!merchantId) {
-      return res.status(400).json({ success: false, message: "ID de comercio no encontrado en el token" });
+      return res.status(400).json({
+        success: false,
+        message: "ID de comercio no encontrado en el token"
+      });
     }
 
-    // Consulta de resumen diario utilizando conversión estricta ::text para UUIDs
+    const filterClause = `
+      (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text)
+      AND UPPER(COALESCE(t.type, '')) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
+      AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
+          (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+    `;
+
     const summaryQuery = `
       SELECT 
-        COALESCE(SUM(amount), 0) AS total_sales, 
+        COALESCE(SUM(t.amount), 0) AS total_sales, 
         COUNT(*) AS total_transactions
-      FROM transactions 
-      WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) 
-        AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-        AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date;
+      FROM transactions t
+      WHERE ${filterClause};
     `;
-    const summaryRes = await pool.query(summaryQuery, [String(merchantId)]);
 
-    // Consulta detallada de transacciones del día para el comercio (misma regla de fecha que el resumen)
     const txQuery = `
-      SELECT t.*, u.full_name AS client_name 
+      SELECT 
+        t.*,
+        COALESCE(u.full_name, 'Cliente Tiolito') AS client_name,
+        COALESCE(u.phone_number, 'N/A') AS client_phone
       FROM transactions t
       LEFT JOIN users u ON t.client_id::text = u.id::text
-      WHERE (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text) 
-        AND UPPER(t.type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-        AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+      WHERE ${filterClause}
       ORDER BY t.created_at DESC;
     `;
-    const txRes = await pool.query(txQuery, [String(merchantId)]);
 
-    res.json({
+    const [summaryRes, txRes] = await Promise.all([
+      pool.query(summaryQuery, [merchantId]),
+      pool.query(txQuery, [merchantId])
+    ]);
+
+    const rawSummary = summaryRes.rows[0] || { total_sales: 0, total_transactions: 0 };
+    const totalSales = Math.round((Number(rawSummary.total_sales || 0) + Number.EPSILON) * 100) / 100;
+    const totalTransactions = parseInt(rawSummary.total_transactions || 0, 10);
+
+    return res.json({
       success: true,
-      summary: summaryRes.rows[0],
+      summary: {
+        total_sales: totalSales,
+        total_transactions: totalTransactions
+      },
       transactions: txRes.rows
     });
 
   } catch (error) {
     console.error("Error al generar el corte del comercio:", error);
-    res.status(500).json({ success: false, message: "Error al generar el reporte" });
+    return res.status(500).json({
+      success: false,
+      message: "Error al generar el reporte"
+    });
   }
 });
 
