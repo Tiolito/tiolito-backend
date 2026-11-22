@@ -1734,36 +1734,37 @@ app.get('/api/merchant/balance', verifyToken, requireRole('MERCHANT', 'COMERCIO'
     }
 });
 
-// 2. Generar orden de cobro (Código / QR dinámico)
-// Memoria temporal para los cobros activos (o guárdalos en tu base de datos)
-const activeCharges = {};
-
+// ==========================================
+// 2. Generar orden de cobro (Código / QR dinámico en PostgreSQL)
+// ==========================================
 app.post('/api/merchant/generate-charge', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     try {
-        const { amount } = req.body;
-        const merchantId = req.user.id;
+        const rawAmount = parseFloat(req.body.amount);
+        const amount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
+        const merchantId = String(req.user.id);
 
-        if (!amount || parseFloat(amount) <= 0) {
+        if (Number.isNaN(amount) || amount <= 0) {
             return res.status(400).json({ success: false, error: 'Ingresa un monto válido para cobrar' });
         }
 
         const chargeCode = 'CHG-' + Math.floor(100000 + Math.random() * 900000);
-        
-        // Guardamos el monto, el comercio y la hora de creación
-        activeCharges[chargeCode] = {
-            merchantId: merchantId,
-            amount: parseFloat(amount),
-            createdAt: Date.now() // 👈 Guardamos el timestamp actual
-        };
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // Expira en 5 minutos
 
-        res.json({ 
-            success: true, 
+        await pool.query(
+            `INSERT INTO charge_orders (code, merchant_id, amount, status, expires_at)
+             VALUES ($1, $2, $3, 'PENDING', $4)`,
+            [chargeCode, merchantId, amount, expiresAt]
+        );
+
+        return res.json({
+            success: true,
             charge_code: chargeCode,
+            expires_at: expiresAt,
             message: "Orden de cobro generada exitosamente (Expira en 5 minutos)"
         });
     } catch (error) {
         console.error("Error al generar orden de cobro:", error);
-        res.status(500).json({ success: false, error: "Error interno al generar una orden de cobro" });
+        return res.status(500).json({ success: false, error: "Error interno al generar una orden de cobro" });
     }
 });
 
@@ -1859,54 +1860,93 @@ app.get('/api/merchant/transactions', verifyToken, requireRole('MERCHANT', 'COME
 });
 
 // ==========================================
-// ENDPOINT: POST /api/client/pay-merchant (Corregido para evitar conflicto de tipos)
+// ENDPOINT: POST /api/client/pay-merchant (Con orden en PostgreSQL y bloqueo FOR UPDATE)
 // ==========================================
 app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
-    const clientId = req.user.id;
-    const { charge_code } = req.body;
+    const clientId = String(req.user.id);
+    const chargeCode = String(req.body.charge_code || '').trim();
 
-    if (!charge_code) {
+    if (!chargeCode) {
         return res.status(400).json({ success: false, error: 'Ingresa o escanea un código de cobro válido.' });
     }
-
-    // 1. VALIDAR QUE EL CÓDIGO EXISTA
-    const chargeInfo = activeCharges[charge_code];
-    if (!chargeInfo) {
-        return res.status(400).json({ success: false, error: 'El código de cobro ya fue utilizado o es inválido.' });
-    }
-
-    // 🕒 VALIDAR EXPIRACIÓN (5 Minutos = 300,000 milisegundos)
-    const CINCO_MINUTOS = 5 * 60 * 1000;
-    if (Date.now() - chargeInfo.createdAt > CINCO_MINUTOS) {
-        delete activeCharges[charge_code]; // Lo borramos por caducar
-        return res.status(400).json({ success: false, error: 'El código de cobro ha expirado (más de 5 minutos).' });
-    }
-
-    const amountToPay = chargeInfo.amount; // Monto bruto que paga el cliente
-    const merchantUserId = chargeInfo.merchantId;
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // 2. Obtener datos y tipo del comercio receptor (Forzando conversión segura a texto con ::text)
-        const merchantRes = await client.query(
-            'SELECT id, full_name, merchant_type, tier FROM users WHERE id::text = $1::text', 
-            [String(merchantUserId)]
+        // 1. Buscar y bloquear la orden de cobro en PostgreSQL
+        const chargeRes = await client.query(
+            `SELECT id, code, merchant_id, amount, status, expires_at
+             FROM charge_orders
+             WHERE code = $1
+             FOR UPDATE`,
+            [chargeCode]
         );
 
-        if (merchantRes.rows.length === 0) {
+        if (chargeRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, error: 'El código de cobro ya fue utilizado o es inválido.' });
+        }
+
+        const chargeOrder = chargeRes.rows[0];
+
+        if (String(chargeOrder.status || '').toUpperCase() !== 'PENDING') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, error: 'El código de cobro ya fue utilizado o no está disponible.' });
+        }
+
+        // 🕒 2. VALIDAR EXPIRACIÓN (5 Minutos)
+        if (new Date(chargeOrder.expires_at) <= new Date()) {
+            await client.query(
+                `UPDATE charge_orders
+                 SET status = 'EXPIRED'
+                 WHERE id = $1 AND status = 'PENDING'`,
+                [chargeOrder.id]
+            );
+            await client.query('COMMIT');
+            return res.status(400).json({ success: false, error: 'El código de cobro ha expirado (más de 5 minutos).' });
+        }
+
+        const amountToPay = round2(parseFloat(chargeOrder.amount)); // Monto bruto que paga el cliente
+        const merchantUserId = String(chargeOrder.merchant_id);
+
+        if (clientId === merchantUserId) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, error: 'No puedes pagar tu propia orden de cobro.' });
+        }
+
+        // 3. Bloquear en orden determinista cliente y comercio para evitar deadlocks
+        const accountIds = [clientId, merchantUserId].sort((a, b) => a.localeCompare(b));
+        const lockedUsers = new Map();
+
+        for (const accId of accountIds) {
+            const uRes = await client.query(
+                'SELECT id, full_name, phone_number, balance, merchant_type, tier FROM users WHERE id::text = $1::text FOR UPDATE',
+                [accId]
+            );
+            if (uRes.rows.length > 0) {
+                lockedUsers.set(accId, uRes.rows[0]);
+            }
+        }
+
+        const merchantData = lockedUsers.get(merchantUserId);
+        if (!merchantData) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, error: 'Comercio receptor no encontrado.' });
         }
 
-        const merchantData = merchantRes.rows[0];
-        const merchantName = merchantData.full_name || 'Comercio Local';
-        
-        // Detectar tipo de comercio (soporta 'merchant_type' o 'tier')
-        const merchantType = (merchantData.merchant_type || merchantData.tier || 'small').toLowerCase();
+        const clientData = lockedUsers.get(clientId);
+        if (!clientData) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
+        }
 
-        // 🛡️ 3. APLICAR LÍMITES SEGÚN EL TIPO DE COMERCIO
+        const merchantName = merchantData.full_name || 'Comercio Local';
+
+        // Detectar tipo de comercio (soporta 'merchant_type' o 'tier')
+        const merchantType = String(merchantData.merchant_type || merchantData.tier || 'small').toLowerCase();
+
+        // 🛡️ 4. APLICAR LÍMITES SEGÚN EL TIPO DE COMERCIO
         let limiteMaxPerTx = 2500.00;
         let limiteMaxDaily = 10000.00;
         let tasaComision = 0.020; // 2.0% por defecto para pequeños
@@ -1920,94 +1960,111 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         // Validar límite por transacción individual
         if (amountToPay > limiteMaxPerTx) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ 
-                success: false, 
-                error: `El monto excede el límite permitido para este tipo de comercio (Máx. Q${limiteMaxPerTx.toFixed(2)}).` 
+            return res.status(400).json({
+                success: false,
+                error: `El monto excede el límite permitido para este tipo de comercio (Máx. Q${limiteMaxPerTx.toFixed(2)}).`
             });
         }
 
         // Consultar acumulado diario del comercio en transacciones de hoy (Convertido a texto para evitar errores)
         const ventasHoyRes = await client.query(
-            `SELECT COALESCE(SUM(amount), 0) AS total_hoy FROM transactions 
-             WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text) AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date`,
-            [String(merchantUserId)]
+            `SELECT COALESCE(SUM(amount), 0) AS total_hoy
+             FROM transactions
+             WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text)
+               AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
+               AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date`,
+            [merchantUserId]
         );
-        const totalVentasHoy = parseFloat(ventasHoyRes.rows[0].total_hoy || 0);
+        const totalVentasHoy = round2(parseFloat(ventasHoyRes.rows[0].total_hoy || 0));
 
-        if (totalVentasHoy + amountToPay > limiteMaxDaily) {
+        if (round2(totalVentasHoy + amountToPay) > limiteMaxDaily) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ 
-                success: false, 
-                error: `El comercio ha alcanzado su límite diario acumulado permitido (Máx. Q${limiteMaxDaily.toFixed(2)}).` 
+            return res.status(400).json({
+                success: false,
+                error: `El comercio ha alcanzado su límite diario acumulado permitido (Máx. Q${limiteMaxDaily.toFixed(2)}).`
             });
         }
 
-        // 4. Obtener datos del cliente pagador (Convertido a texto de forma segura)
-        const clientCheck = await client.query('SELECT id, full_name, phone_number, balance FROM users WHERE id::text = $1::text FOR UPDATE', [String(clientId)]);
-        if (clientCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, error: 'Usuario no encontrado.' });
-        }
-        const clientData = clientCheck.rows[0];
-        const clientBalance = parseFloat(clientData.balance || 0);
-
+        // 5. Validar saldo del cliente pagador
+        const clientBalance = round2(parseFloat(clientData.balance || 0));
         if (clientBalance < amountToPay) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: `Saldo insuficiente. Tienes Q${clientBalance} y necesitas Q${amountToPay}.` });
+            return res.status(400).json({
+                success: false,
+                error: `Saldo insuficiente. Tienes Q${clientBalance.toFixed(2)} y necesitas Q${amountToPay.toFixed(2)}.`
+            });
         }
 
-        // 🚀 5. CÁLCULO DINÁMICO DE COMISIONES
-        const comisionTiolito = Number((amountToPay * tasaComision).toFixed(2));
-        const montoNetoComercio = Number((amountToPay - comisionTiolito).toFixed(2));
+        // 🚀 6. CÁLCULO DINÁMICO DE COMISIONES
+        const comisionTiolito = round2(amountToPay * tasaComision);
+        const montoNetoComercio = round2(amountToPay - comisionTiolito);
+        const newClientBalance = round2(clientBalance - amountToPay);
+        const newMerchantBalance = round2(parseFloat(merchantData.balance || 0) + montoNetoComercio);
 
-        // 6. Descontar el monto total al cliente
-        await client.query('UPDATE users SET balance = balance - $1 WHERE id::text = $2::text', [amountToPay, String(clientId)]);
-
-        // 7. Acreditar el monto NETO al comercio
-        await client.query('UPDATE users SET balance = balance + $1 WHERE id::text = $2::text', [montoNetoComercio, String(merchantUserId)]);
-        try {
-            await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id::text = $2::text', [montoNetoComercio, String(merchantUserId)]);
-        } catch (eWallet) {}
-
-        // 8. Acreditar el 100% de la comisión a Tiolito Admin automáticamente
-        const adminRes = await client.query(
-            "SELECT id FROM users WHERE role = 'ADMIN' OR phone_number = '00000000' LIMIT 1"
+        // 7. Descontar el monto total al cliente
+        await client.query(
+            'UPDATE users SET balance = $1 WHERE id::text = $2::text',
+            [newClientBalance, clientId]
         );
-        if (adminRes.rows.length > 0) {
-            const adminId = adminRes.rows[0].id;
-            await client.query('UPDATE users SET balance = balance + $1 WHERE id::text = $2::text', [comisionTiolito, String(adminId)]);
-            try {
-                await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id::text = $2::text', [comisionTiolito, String(adminId)]);
-            } catch (eWalletAdmin) {}
+
+        // 8. Acreditar el monto NETO al comercio
+        await client.query(
+            'UPDATE users SET balance = $1 WHERE id::text = $2::text',
+            [newMerchantBalance, merchantUserId]
+        );
+        await client.query(
+            'UPDATE wallets SET balance = ROUND((balance + $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+            [montoNetoComercio, merchantUserId]
+        );
+
+        // 9. Acreditar el 100% de la comisión a Tiolito Admin automáticamente
+        if (comisionTiolito > 0) {
+            const adminRes = await client.query(
+                "SELECT id FROM users WHERE UPPER(role) = 'ADMIN' OR phone_number = '00000000' ORDER BY id ASC LIMIT 1 FOR UPDATE"
+            );
+            if (adminRes.rows.length > 0) {
+                const adminId = String(adminRes.rows[0].id);
+                await client.query(
+                    'UPDATE users SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2) WHERE id::text = $2::text',
+                    [comisionTiolito, adminId]
+                );
+                await client.query(
+                    'UPDATE wallets SET balance = ROUND((balance + $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+                    [comisionTiolito, adminId]
+                );
+            }
         }
 
-        // 9. Registrar la transacción en la base de datos
-        const folioUnico = `TRX-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
-
+        // 10. Registrar la transacción en la base de datos y marcar la orden como PAID
         const txResult = await client.query(
-            `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at) 
-             VALUES ($1, $2, $3, $4, 'MERCHANT-PAYMENT', NOW()) RETURNING id, created_at`,
+            `INSERT INTO transactions (agent_id, client_id, merchant_id, amount, type, created_at)
+             VALUES ($1, $2, $3, $4, 'MERCHANT-PAYMENT', NOW())
+             RETURNING id, created_at`,
             [merchantUserId, clientId, merchantUserId, amountToPay]
         );
 
-        await client.query('COMMIT');
+        await client.query(
+            `UPDATE charge_orders
+             SET status = 'PAID', paid_by_client_id = $1, paid_at = NOW()
+             WHERE id = $2`,
+            [clientId, chargeOrder.id]
+        );
 
-        // 10. ANULAR EL CÓDIGO INMEDIATAMENTE
-        delete activeCharges[charge_code];
+        await client.query('COMMIT');
 
         const receiptPayload = {
             folio: `TRX-${txResult.rows[0].id}`,
             id: txResult.rows[0].id,
             type: 'Pago a Comercio',
             sender_name: clientData.full_name,
-            senderName: clientData.full_name,          
-            clientName: clientData.full_name,          
+            senderName: clientData.full_name,
+            clientName: clientData.full_name,
             full_name: clientData.full_name,
             sender_phone: clientData.phone_number,
             merchant_name: merchantName,
-            merchantName: merchantName,                
+            merchantName: merchantName,
             amount: amountToPay,
-            net_amount: montoNetoComercio,      
+            net_amount: montoNetoComercio,
             commission: comisionTiolito,
             merchant_type: merchantType,
             created_at: txResult.rows[0].created_at
@@ -2024,9 +2081,13 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error('Error en ROLLBACK (pay-merchant):', rollbackErr);
+        }
         console.error('Error al procesar pago a comercio:', error);
-        return res.status(500).json({ success: false, error: 'Error al procesar el pago' });
+        return res.status(500).json({ success: false, error: 'Error interno al procesar el pago' });
     } finally {
         client.release();
     }
