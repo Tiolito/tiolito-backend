@@ -1803,7 +1803,7 @@ app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
     const filterClause = `
       (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text)
       AND UPPER(COALESCE(t.type, '')) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-      AND (t.created_at AT TIME ZONE 'America/Guatemala')::date =
+      AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
           (NOW() AT TIME ZONE 'America/Guatemala')::date
     `;
 
