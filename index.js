@@ -1771,8 +1771,20 @@ app.post('/api/merchant/generate-charge', verifyToken, requireRole('MERCHANT', '
 // ==========================================
 // ENDPOINT: GET /api/merchant/daily-report (UUID, Auth por Token y TZ Guatemala)
 // ==========================================
-app.get('/api/merchant/daily-report', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
+const hasMerchantRole = (role) => {
+  const normalized = String(role || '').trim().toUpperCase();
+  return normalized === 'MERCHANT' || normalized === 'COMERCIO' || normalized.includes('MERCHANT') || normalized.includes('COMERCIO');
+};
+
+app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
   try {
+    if (!hasMerchantRole(req.user?.role)) {
+      return res.status(403).json({
+        success: false,
+        error: `Acceso denegado para el rol: ${req.user?.role || 'desconocido'}`
+      });
+    }
+
     const merchantId = String(req.user?.id || '').trim();
 
     if (!merchantId) {
