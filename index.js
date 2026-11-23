@@ -2470,6 +2470,273 @@ app.post('/api/merchant/withdraw-bank', verifyToken, requireRole('MERCHANT', 'CO
 });
 
 // ==========================================
+// RECARGA DE SALDO PARA AGENTES (SOLICITUD + APROBACIÓN ADMIN)
+// ==========================================
+
+// 1. Agente crea una solicitud de recarga tras depositar/transferir
+app.post('/api/agent/balance-requests', verifyToken, requireRole('AGENT'), async (req, res) => {
+  const agentId = String(req.user.id);
+  const rawAmount = parseFloat(req.body.amount);
+  const amount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
+  const bankName = String(req.body.bank_name || '').trim();
+  const referenceNumber = String(req.body.reference_number || '').trim();
+  const notes = req.body.notes ? String(req.body.notes).trim() : null;
+
+  if (Number.isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, error: 'Ingresa un monto válido mayor a Q0.00.' });
+  }
+
+  if (!bankName || !referenceNumber) {
+    return res.status(400).json({ success: false, error: 'Ingresa el banco/canal y el número de boleta o referencia.' });
+  }
+
+  try {
+    // Evitar reutilizar la misma referencia/boleta en solicitudes pendientes o ya aprobadas
+    const dupRes = await pool.query(
+      `SELECT id, status
+       FROM agent_balance_requests
+       WHERE UPPER(TRIM(reference_number)) = UPPER($1)
+         AND UPPER(TRIM(bank_name)) = UPPER($2)
+         AND status IN ('PENDING', 'APPROVED')
+       LIMIT 1`,
+      [referenceNumber, bankName]
+    );
+
+    if (dupRes.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Ese número de boleta o referencia ya fue registrado para este banco.'
+      });
+    }
+
+    const insertRes = await pool.query(
+      `INSERT INTO agent_balance_requests (agent_id, amount, bank_name, reference_number, notes, status, created_at)
+       VALUES ($1::uuid, $2, $3, $4, $5, 'PENDING', NOW())
+       RETURNING id, agent_id, amount, bank_name, reference_number, notes, status, created_at`,
+      [agentId, amount, bankName, referenceNumber, notes]
+    );
+
+    return res.status(201).json({
+      success: true,
+      request: insertRes.rows[0],
+      message: 'Solicitud de recarga enviada. Queda pendiente de validación por administración.'
+    });
+  } catch (error) {
+    console.error('Error al crear solicitud de recarga de agente:', error);
+    return res.status(500).json({ success: false, error: 'Error interno al enviar la solicitud.' });
+  }
+});
+
+// 2. Agente consulta sus solicitudes de recarga
+app.get('/api/agent/balance-requests', verifyToken, requireRole('AGENT'), async (req, res) => {
+  const agentId = String(req.user.id);
+
+  try {
+    const result = await pool.query(
+      `SELECT id, amount, bank_name, reference_number, notes, status, admin_note, created_at, reviewed_at
+       FROM agent_balance_requests
+       WHERE agent_id::text = $1::text
+       ORDER BY created_at DESC
+       LIMIT 30`,
+      [agentId]
+    );
+
+    return res.json({ success: true, requests: result.rows });
+  } catch (error) {
+    console.error('Error al consultar solicitudes del agente:', error);
+    return res.status(500).json({ success: false, error: 'Error interno al obtener tus solicitudes.' });
+  }
+});
+
+// 3. Admin lista solicitudes de recarga de agentes (por defecto PENDING)
+app.get('/api/admin/balance-requests', verifyToken, requireRole('ADMIN'), async (req, res) => {
+  const statusParam = String(req.query.status || 'PENDING').toUpperCase();
+
+  try {
+    let query = `
+      SELECT
+        r.id,
+        r.agent_id,
+        r.amount,
+        r.bank_name,
+        r.reference_number,
+        r.notes,
+        r.status,
+        r.admin_note,
+        r.created_at,
+        r.reviewed_at,
+        COALESCE(u.full_name, 'Agente') AS agent_name,
+        COALESCE(u.phone_number, 'N/A') AS agent_phone,
+        COALESCE(u.balance, 0) AS current_balance
+      FROM agent_balance_requests r
+      LEFT JOIN users u ON r.agent_id::text = u.id::text
+    `;
+
+    const params = [];
+    if (['PENDING', 'APPROVED', 'REJECTED'].includes(statusParam)) {
+      params.push(statusParam);
+      query += ` WHERE UPPER(r.status) = $1`;
+    }
+
+    query += ` ORDER BY r.created_at DESC LIMIT 50`;
+
+    const result = await pool.query(query, params);
+    return res.json({ success: true, requests: result.rows });
+  } catch (error) {
+    console.error('Error al listar solicitudes de recarga para admin:', error);
+    return res.status(500).json({ success: false, error: 'Error interno al cargar solicitudes de agentes.' });
+  }
+});
+
+// 4. Admin aprueba una solicitud y acredita el saldo al agente
+app.post('/api/admin/balance-requests/:id/approve', verifyToken, requireRole('ADMIN'), async (req, res) => {
+  const requestId = parseInt(req.params.id, 10);
+  const adminId = String(req.user.id);
+  const adminNote = req.body?.admin_note ? String(req.body.admin_note).trim() : null;
+
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return res.status(400).json({ success: false, error: 'ID de solicitud inválido.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const reqRes = await client.query(
+      `SELECT id, agent_id, amount, bank_name, reference_number, status
+       FROM agent_balance_requests
+       WHERE id = $1
+       FOR UPDATE`,
+      [requestId]
+    );
+
+    if (reqRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Solicitud no encontrada.' });
+    }
+
+    const reqRow = reqRes.rows[0];
+    if (String(reqRow.status).toUpperCase() !== 'PENDING') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, error: 'Esta solicitud ya fue procesada anteriormente.' });
+    }
+
+    const creditAmount = round2(parseFloat(reqRow.amount));
+    const targetAgentId = String(reqRow.agent_id);
+
+    // Bloquear agente antes de acreditar saldo
+    const agentRes = await client.query(
+      `SELECT id, balance FROM users WHERE id::text = $1::text FOR UPDATE`,
+      [targetAgentId]
+    );
+
+    if (agentRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Agente asociado no encontrado.' });
+    }
+
+    await client.query(
+      `UPDATE users
+       SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2)
+       WHERE id::text = $2::text`,
+      [creditAmount, targetAgentId]
+    );
+
+    await client.query(
+      `UPDATE wallets
+       SET balance = ROUND((COALESCE(balance, 0) + $1)::numeric, 2), updated_at = NOW()
+       WHERE user_id::text = $2::text`,
+      [creditAmount, targetAgentId]
+    );
+
+    await client.query(
+      `UPDATE agent_balance_requests
+       SET status = 'APPROVED',
+           admin_note = COALESCE($1, admin_note),
+           reviewed_by = $2::uuid,
+           reviewed_at = NOW()
+       WHERE id = $3`,
+      [adminNote, adminId, requestId]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      message: `Recarga de Q${creditAmount.toFixed(2)} aprobada y acreditada al agente.`
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rbErr) {
+      console.error('Error en ROLLBACK (approve balance request):', rbErr);
+    }
+    console.error('Error al aprobar solicitud de recarga:', error);
+    return res.status(500).json({ success: false, error: 'Error interno al aprobar la recarga.' });
+  } finally {
+    client.release();
+  }
+});
+
+// 5. Admin rechaza una solicitud sin modificar saldos
+app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADMIN'), async (req, res) => {
+  const requestId = parseInt(req.params.id, 10);
+  const adminId = String(req.user.id);
+  const adminNote = req.body?.admin_note ? String(req.body.admin_note).trim() : 'Comprobante no verificado';
+
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return res.status(400).json({ success: false, error: 'ID de solicitud inválido.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const reqRes = await client.query(
+      `SELECT id, status FROM agent_balance_requests WHERE id = $1 FOR UPDATE`,
+      [requestId]
+    );
+
+    if (reqRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Solicitud no encontrada.' });
+    }
+
+    if (String(reqRes.rows[0].status).toUpperCase() !== 'PENDING') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, error: 'Esta solicitud ya fue procesada.' });
+    }
+
+    await client.query(
+      `UPDATE agent_balance_requests
+       SET status = 'REJECTED',
+           admin_note = $1,
+           reviewed_by = $2::uuid,
+           reviewed_at = NOW()
+       WHERE id = $3`,
+      [adminNote, adminId, requestId]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      message: 'Solicitud de recarga rechazada.'
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rbErr) {
+      console.error('Error en ROLLBACK (reject balance request):', rbErr);
+    }
+    console.error('Error al rechazar solicitud de recarga:', error);
+    return res.status(500).json({ success: false, error: 'Error interno al rechazar la solicitud.' });
+  } finally {
+    client.release();
+  }
+});
+
+// ==========================================
 // Endpoint para que el Admin vea las solicitudes ACH pendientes (Comercios y Agentes)
 // ==========================================
 app.get('/api/admin/bank-withdrawals', verifyToken, requireRole('ADMIN'), async (req, res) => {
