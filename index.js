@@ -2607,7 +2607,7 @@ app.get('/api/admin/bank-withdrawals-history', verifyToken, requireRole('ADMIN')
 // ==========================================
 app.get('/api/admin/balance', verifyToken, requireRole('ADMIN'), async (req, res) => {
     // Opcional: Validar que el usuario que hace la petición realmente sea 'admin'
-    if (req.user.role !== 'ADMIN') {
+   if (String(req.user?.role || '').toUpperCase() !== 'ADMIN') {
         return res.status(403).json({ success: false, error: 'Acceso denegado. Se requiere rol de administrador.' });
     }
 
