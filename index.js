@@ -2588,7 +2588,9 @@ app.get('/api/admin/balance-requests', verifyToken, requireRole('ADMIN'), async 
   }
 });
 
+// ==========================================
 // 4. Admin aprueba una solicitud y acredita el saldo al agente
+// ==========================================
 app.post('/api/admin/balance-requests/:id/approve', verifyToken, requireRole('ADMIN'), async (req, res) => {
   const requestId = parseInt(req.params.id, 10);
   const adminId = String(req.user.id);
@@ -2688,7 +2690,9 @@ app.post('/api/admin/balance-requests/:id/approve', verifyToken, requireRole('AD
   }
 });
 
+// ==========================================
 // 5. Admin rechaza una solicitud sin modificar saldos
+// ==========================================
 app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADMIN'), async (req, res) => {
   const requestId = parseInt(req.params.id, 10);
   const adminId = String(req.user.id);
@@ -2703,7 +2707,10 @@ app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADM
     await client.query('BEGIN');
 
     const reqRes = await client.query(
-      `SELECT id, status FROM agent_balance_requests WHERE id = $1 FOR UPDATE`,
+      `SELECT id, agent_id, amount, status
+       FROM agent_balance_requests
+       WHERE id = $1
+       FOR UPDATE`,
       [requestId]
     );
 
@@ -2712,10 +2719,13 @@ app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADM
       return res.status(404).json({ success: false, error: 'Solicitud no encontrada.' });
     }
 
-    if (String(reqRes.rows[0].status).toUpperCase() !== 'PENDING') {
+    const reqRow = reqRes.rows[0];
+    if (String(reqRow.status).toUpperCase() !== 'PENDING') {
       await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, error: 'Esta solicitud ya fue procesada.' });
+      return res.status(400).json({ success: false, error: 'Esta solicitud ya fue procesada anteriormente.' });
     }
+
+    const targetAgentId = String(reqRow.agent_id);
 
     await client.query(
       `UPDATE agent_balance_requests
@@ -2729,13 +2739,15 @@ app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADM
 
     await client.query('COMMIT');
 
+    // Emitir actualización en tiempo real a la sala del agente
     const ioInstance = req.app.get('io') || global.io;
-if (ioInstance) {
-  ioInstance.to(`agent_${reqRow.agent_id}`).emit('agent_balance_request_updated', {
-    requestId,
-    status: 'REJECTED'
-  });
-}
+    if (ioInstance) {
+      ioInstance.to(`agent_${targetAgentId}`).emit('agent_balance_request_updated', {
+        requestId,
+        status: 'REJECTED',
+        admin_note: adminNote
+      });
+    }
 
     return res.json({
       success: true,
