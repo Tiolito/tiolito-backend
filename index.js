@@ -2661,6 +2661,16 @@ app.post('/api/admin/balance-requests/:id/approve', verifyToken, requireRole('AD
 
     await client.query('COMMIT');
 
+    // Emitir actualización en tiempo real a la sala del agente
+    const ioInstance = req.app.get('io') || global.io;
+    if (ioInstance) {
+      ioInstance.to(`agent_${targetAgentId}`).emit('agent_balance_request_updated', {
+        requestId,
+        status: 'APPROVED',
+        amount: creditAmount
+      });
+    }
+
     return res.json({
       success: true,
       message: `Recarga de Q${creditAmount.toFixed(2)} aprobada y acreditada al agente.`
@@ -2718,6 +2728,14 @@ app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADM
     );
 
     await client.query('COMMIT');
+
+    const ioInstance = req.app.get('io') || global.io;
+if (ioInstance) {
+  ioInstance.to(`agent_${reqRow.agent_id}`).emit('agent_balance_request_updated', {
+    requestId,
+    status: 'REJECTED'
+  });
+}
 
     return res.json({
       success: true,
