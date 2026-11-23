@@ -638,9 +638,6 @@ app.get('/api/client/balance', verifyToken, async (req, res) => {
     }
 });
 
-// ==========================================
-// 11. ENDPOINT: GET /api/client/transactions (Historial completo del cliente)
-// ==========================================
 app.get('/api/client/transactions', verifyToken, async (req, res) => {
     const userIdFromToken = req.user.id;
 
@@ -650,11 +647,20 @@ app.get('/api/client/transactions', verifyToken, async (req, res) => {
                 t.id, 
                 t.amount, 
                 t.type AS original_type,
+                t.bank_name,
+                t.account_number,
+                t.account_type,
                 CASE 
                     WHEN UPPER(t.type) = 'MERCHANT-PAYMENT' THEN 'Pago a Comercio'
                     WHEN UPPER(t.type) IN ('CASH-IN', 'CASH_IN') THEN 'Depósito (Cash-In)'
                     WHEN UPPER(t.type) IN ('CASH-OUT', 'CASH_OUT') THEN 'Retiro (Cash-Out)'
                     WHEN UPPER(t.type) = 'REFUND' THEN 'Reembolso Recibido'
+                    WHEN UPPER(t.type) LIKE 'BANK-WITHDRAWAL%' OR UPPER(t.type) LIKE '%ACH%' THEN
+                        CASE
+                            WHEN UPPER(t.type) LIKE '%PENDING%' OR UPPER(t.type) LIKE '%PENDIENTE%' THEN 'BANK-WITHDRAWAL-PENDING'
+                            WHEN UPPER(t.type) LIKE '%PAID%' OR UPPER(t.type) LIKE '%COMPLETED%' OR UPPER(t.type) LIKE '%APPROVED%' THEN 'BANK-WITHDRAWAL-PAID'
+                            ELSE 'BANK-WITHDRAWAL'
+                        END
                     WHEN UPPER(t.type) LIKE '%TRANSFER%' AND t.client_id::text = $1::text THEN 'TRANSFER-IN'
                     WHEN UPPER(t.type) LIKE '%TRANSFER%' AND t.agent_id::text = $1::text THEN 'TRANSFER-OUT'
                     WHEN t.client_id::text = $1::text THEN 'TRANSFER-IN'
@@ -668,7 +674,7 @@ app.get('/api/client/transactions', verifyToken, async (req, res) => {
                 sender.phone_number AS sender_phone,
                 receiver.full_name AS receiver_name,
                 receiver.phone_number AS receiver_phone,
-                client_user.phone_number AS client_phone -- 👈 Asegurar esta línea
+                client_user.phone_number AS client_phone
             FROM transactions t
             LEFT JOIN users merchant_user ON t.merchant_id::text = merchant_user.id::text
             LEFT JOIN users agent_user ON t.agent_id::text = agent_user.id::text
