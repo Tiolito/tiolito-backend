@@ -33,6 +33,13 @@ io.on('connection', (socket) => {
     console.log(`Cliente unido a la sala: client_${clientId}`);
   });
 
+  // 👉 NUEVO: Unir al agente a su propia sala
+  socket.on('join_agent_room', (agentId) => {
+    if (!agentId) return;
+    socket.join(`agent_${agentId}`);
+    console.log(`Agente unido a la sala: agent_${agentId}`);
+  });
+
   socket.on('disconnect', () => {
     console.log('Socket desconectado:', socket.id);
   });
@@ -2664,7 +2671,11 @@ app.post('/api/admin/balance-requests/:id/approve', verifyToken, requireRole('AD
     await client.query('COMMIT');
 
     // Emitir actualización en tiempo real a la sala del agente
-    const ioInstance = req.app.get('io') || global.io;
+    const ioInstance =
+      (typeof io !== 'undefined' && io) ||
+      (req.app && typeof req.app.get === 'function' && req.app.get('io')) ||
+      global.io;
+
     if (ioInstance) {
       ioInstance.to(`agent_${targetAgentId}`).emit('agent_balance_request_updated', {
         requestId,
@@ -2740,7 +2751,11 @@ app.post('/api/admin/balance-requests/:id/reject', verifyToken, requireRole('ADM
     await client.query('COMMIT');
 
     // Emitir actualización en tiempo real a la sala del agente
-    const ioInstance = req.app.get('io') || global.io;
+    const ioInstance =
+      (typeof io !== 'undefined' && io) ||
+      (req.app && typeof req.app.get === 'function' && req.app.get('io')) ||
+      global.io;
+
     if (ioInstance) {
       ioInstance.to(`agent_${targetAgentId}`).emit('agent_balance_request_updated', {
         requestId,
