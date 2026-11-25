@@ -3402,7 +3402,7 @@ app.get('/api/agent/commissions-summary', verifyToken, requireRole('AGENT'), asy
 });
 
 // ==========================================
-// ENDPOINT: GET /api/admin/financial-overview
+// ENDPOINT: GET /api/admin/financial-overview (Horario Guatemala)
 // ==========================================
 app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), async (req, res) => {
   try {
@@ -3420,8 +3420,8 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
       SELECT
         COALESCE(SUM(admin_commission), 0) AS total_admin_commissions,
         COALESCE(SUM(CASE
-          WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
-               (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+          WHEN (created_at AT TIME ZONE 'America/Guatemala')::date =
+               (NOW() AT TIME ZONE 'America/Guatemala')::date
           THEN admin_commission ELSE 0
         END), 0) AS today_admin_commissions
       FROM platform_commissions
@@ -3433,8 +3433,8 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
         COUNT(*) AS tx_count,
         COALESCE(SUM(amount), 0) AS total_amount
       FROM transactions
-      WHERE (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
-            (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+      WHERE (created_at AT TIME ZONE 'America/Guatemala')::date =
+            (NOW() AT TIME ZONE 'America/Guatemala')::date
       GROUP BY UPPER(COALESCE(type, ''))
       ORDER BY total_amount DESC
     `);
