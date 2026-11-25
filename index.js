@@ -498,7 +498,7 @@ app.get('/api/account/merchant-status', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// 8. ENDPOINT: POST /api/merchant/refund (Reversión de cobros)
+// 8. ENDPOINT: POST /api/merchant/refund (Devolución asumida por el comercio)
 // ==========================================
 app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'), async (req, res) => {
     const { transaction_id } = req.body;
@@ -565,11 +565,11 @@ app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'
             await client.query('ROLLBACK');
             return res.status(400).json({
                 success: false,
-                error: `Saldo insuficiente en comercio para reembolsar (disponible: Q${merchantBalance.toFixed(2)}).`
+                error: `Saldo insuficiente en comercio para cubrir la devolución de Q${refundAmount.toFixed(2)} (disponible: Q${merchantBalance.toFixed(2)}).`
             });
         }
 
-        // 2. Devolver el dinero al cliente (si existe)
+        // 2. Devolver el monto íntegro al cliente (si existe)
         if (clientId && lockedUsers.has(clientId)) {
             await client.query(
                 'UPDATE users SET balance = ROUND((balance + $1)::numeric, 2) WHERE id::text = $2::text',
@@ -577,13 +577,17 @@ app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'
             );
         }
 
-        // 3. Descontar el dinero del saldo del comercio
+        // 3. El comercio asume el monto íntegro de la devolución (la comisión ya cobrada no se toca)
         await client.query(
             'UPDATE users SET balance = ROUND((balance - $1)::numeric, 2) WHERE id::text = $2::text',
             [refundAmount, merchantId]
         );
+        await client.query(
+            'UPDATE wallets SET balance = ROUND((balance - $1)::numeric, 2), updated_at = NOW() WHERE user_id::text = $2::text',
+            [refundAmount, merchantId]
+        );
 
-        // 4. Eliminar el registro original de la venta
+        // 4. Eliminar el registro original de la venta (o conservar si prefieres historial completo)
         await client.query('DELETE FROM transactions WHERE id::text = $1::text', [cleanId]);
 
         // 5. Registrar la transacción de reembolso
@@ -605,7 +609,7 @@ app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'
 
         return res.json({
             success: true,
-            message: `Reembolso de Q${refundAmount.toFixed(2)} procesado con éxito`,
+            message: `Reembolso de Q${refundAmount.toFixed(2)} procesado con éxito (asumido por el comercio)`,
             refund_transaction_id: refundTx.rows[0].id
         });
 
