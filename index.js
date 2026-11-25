@@ -1106,6 +1106,22 @@ app.post('/api/cash-out', verifyToken, requireRole('AGENT'), validarLimitesAML, 
     );
     const transactionIdShort = txResult.rows[0].id;
 
+    // 5. Registrar desglose de comisiones en platform_commissions
+    if (comisiones.comisionTiolito > 0 || comisiones.comisionAgente > 0) {
+      await client.query(
+        `INSERT INTO platform_commissions
+          (transaction_id, source_type, gross_amount, commission_total, agent_commission, admin_commission, created_at)
+         VALUES ($1, 'CASH-OUT', $2, $3, $4, $5, NOW())`,
+        [
+          transactionIdShort,
+          withdrawAmount,
+          comisiones.comisionTotal,
+          comisiones.comisionAgente,
+          comisiones.comisionTiolito
+        ]
+      );
+    }
+
     if (code) {
       await client.query(
         "UPDATE withdrawal_codes SET status = 'USED' WHERE code = $1",
@@ -2233,6 +2249,20 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             [merchantUserId, clientId, merchantUserId, amountToPay]
         );
 
+        // 11. Registrar comisión de administración en platform_commissions
+        if (comisionTiolito > 0) {
+            await client.query(
+                `INSERT INTO platform_commissions
+                  (transaction_id, source_type, gross_amount, commission_total, agent_commission, admin_commission, created_at)
+                 VALUES ($1, 'MERCHANT-PAYMENT', $2, $3, 0.00, $3, NOW())`,
+                [
+                    txResult.rows[0].id,
+                    amountToPay,
+                    comisionTiolito
+                ]
+            );
+        }
+
         await client.query(
             `UPDATE charge_orders
              SET status = 'PAID', paid_by_client_id = $1, paid_at = NOW()
@@ -2260,11 +2290,11 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
             created_at: txResult.rows[0].created_at
         };
 
-        // 11. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
+        // 12. 🚀 NOTIFICAR EN TIEMPO REAL AL COMERCIO VÍA SOCKET
         console.log(`📢 Intentando emitir 'payment_received' a la sala: merchant_${merchantUserId}`);
         io.to(`merchant_${merchantUserId}`).emit('payment_received', receiptPayload);
 
-        // 12. Responder al cliente
+        // 13. Responder al cliente
         return res.json({
             success: true,
             transaction: receiptPayload
@@ -3365,6 +3395,75 @@ app.get('/api/agent/commissions-summary', verifyToken, requireRole('AGENT'), asy
         console.error("Error al calcular comisiones del agente:", error);
         res.status(500).json({ success: false, error: "Error al calcular comisiones" });
     }
+});
+
+// ==========================================
+// ENDPOINT: GET /api/admin/financial-overview
+// ==========================================
+app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const balancesRes = await pool.query(`
+      SELECT
+        UPPER(COALESCE(role, '')) AS role,
+        COALESCE(SUM(balance), 0) AS total_balance,
+        COUNT(*) AS users_count
+      FROM users
+      WHERE UPPER(COALESCE(role, '')) IN ('CLIENT', 'MERCHANT', 'COMERCIO', 'AGENT')
+      GROUP BY UPPER(COALESCE(role, ''))
+    `);
+
+    const commissionsRes = await pool.query(`
+      SELECT
+        COALESCE(SUM(admin_commission), 0) AS total_admin_commissions,
+        COALESCE(SUM(CASE
+          WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
+               (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+          THEN admin_commission ELSE 0
+        END), 0) AS today_admin_commissions
+      FROM platform_commissions
+    `);
+
+    const volumeTodayRes = await pool.query(`
+      SELECT
+        UPPER(COALESCE(type, '')) AS type,
+        COUNT(*) AS tx_count,
+        COALESCE(SUM(amount), 0) AS total_amount
+      FROM transactions
+      WHERE (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
+            (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+      GROUP BY UPPER(COALESCE(type, ''))
+      ORDER BY total_amount DESC
+    `);
+
+    const byRole = { client: 0, merchant: 0, agent: 0 };
+    for (const row of balancesRes.rows) {
+      const val = round2(parseFloat(row.total_balance || 0));
+      if (row.role === 'CLIENT') byRole.client = round2(byRole.client + val);
+      else if (row.role === 'MERCHANT' || row.role === 'COMERCIO') byRole.merchant = round2(byRole.merchant + val);
+      else if (row.role === 'AGENT') byRole.agent = round2(byRole.agent + val);
+    }
+
+    const totalThirdPartyBalances = round2(byRole.client + byRole.merchant + byRole.agent);
+    const commRow = commissionsRes.rows[0] || {};
+
+    return res.json({
+      success: true,
+      balances_by_role: byRole,
+      total_third_party_balances: totalThirdPartyBalances,
+      commissions: {
+        today_admin: round2(parseFloat(commRow.today_admin_commissions || 0)).toFixed(2),
+        total_admin: round2(parseFloat(commRow.total_admin_commissions || 0)).toFixed(2)
+      },
+      volume_today: volumeTodayRes.rows.map((r) => ({
+        type: r.type,
+        tx_count: parseInt(r.tx_count || 0, 10),
+        total_amount: round2(parseFloat(r.total_amount || 0)).toFixed(2)
+      }))
+    });
+  } catch (error) {
+    console.error('Error en GET /api/admin/financial-overview:', error);
+    return res.status(500).json({ success: false, error: 'Error al obtener el resumen financiero.' });
+  }
 });
  
 // Iniciar servidor
