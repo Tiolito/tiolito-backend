@@ -55,6 +55,11 @@ const pool = new Pool({
   }
 });
 
+// Forzar hora de Guatemala en todas las conexiones de PostgreSQL
+pool.on('connect', (client) => {
+  client.query("SET TIME ZONE 'America/Guatemala';");
+});
+
 // Ruta raíz de bienvenida
 app.get('/', (req, res) => {
   res.json({
@@ -342,8 +347,8 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
                  FROM transactions
                  WHERE client_id::text = $1::text
                    AND UPPER(type) = 'TRANSFER-OUT'
-                   AND EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))
-                   AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))`,
+                   AND EXTRACT(MONTH FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'America/Guatemala'))
+                   AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'America/Guatemala'))`,
                 [String(receiver.id)]
             );
 
@@ -474,8 +479,8 @@ app.get('/api/account/merchant-status', verifyToken, async (req, res) => {
              FROM transactions
              WHERE client_id::text = $1::text
                AND UPPER(type) = 'TRANSFER-OUT'
-               AND EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))
-               AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala'))`,
+               AND EXTRACT(MONTH FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'America/Guatemala'))
+               AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'America/Guatemala'))`,
             [String(userId)]
         );
 
@@ -1849,8 +1854,8 @@ async function validarLimitesAML(req, res, next) {
     // 6. Consultar acumulado diario y mensual de forma segura usando el clientId
     const queryAcumulados = `
       SELECT 
-        COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
-        COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
+        COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
+        COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
       FROM transactions 
       WHERE (
   client_id::text = $1::text
@@ -1975,7 +1980,7 @@ app.get('/api/merchant/daily-report', verifyToken, async (req, res) => {
     const filterClause = `
       (t.merchant_id::text = $1::text OR t.agent_id::text = $1::text)
       AND UPPER(COALESCE(t.type, '')) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-      AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date =
+      AND (t.created_at AT TIME ZONE 'America/Guatemala')::date =
           (NOW() AT TIME ZONE 'America/Guatemala')::date
     `;
 
@@ -2182,7 +2187,7 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
              FROM transactions
              WHERE (merchant_id::text = $1::text OR agent_id::text = $1::text)
                AND UPPER(type) IN ('MERCHANT-PAYMENT', 'MERCHANT_PAYMENT')
-               AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date`,
+               AND (created_at AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'America/Guatemala')::date`,
             [merchantUserId]
         );
         const totalVentasHoy = round2(parseFloat(ventasHoyRes.rows[0].total_hoy || 0));
@@ -3362,8 +3367,8 @@ app.get('/api/agent/commissions-summary', verifyToken, requireRole('AGENT'), asy
             FROM transactions
             WHERE agent_id::text = $1::text
               AND UPPER(type) = 'CASH-OUT'
-              AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date = 
-                  (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Guatemala')::date
+              AND (created_at AT TIME ZONE 'America/Guatemala')::date = 
+                  (NOW() AT TIME ZONE 'America/Guatemala')::date
         `;
 
         const result = await pool.query(query, [String(agentId)]);
