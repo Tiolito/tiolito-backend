@@ -3440,7 +3440,7 @@ app.get('/api/agent/commissions-summary', verifyToken, requireRole('AGENT'), asy
 });
 
 // ==========================================
-// ENDPOINT: GET /api/admin/financial-overview (Horario Guatemala)
+// ENDPOINT: GET /api/admin/financial-overview (Horario Guatemala + Auditoría Mensual)
 // ==========================================
 app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), async (req, res) => {
   try {
@@ -3461,7 +3461,12 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
           WHEN (created_at AT TIME ZONE 'America/Guatemala')::date =
                (NOW() AT TIME ZONE 'America/Guatemala')::date
           THEN admin_commission ELSE 0
-        END), 0) AS today_admin_commissions
+        END), 0) AS today_admin_commissions,
+        COALESCE(SUM(CASE
+          WHEN DATE_TRUNC('month', created_at AT TIME ZONE 'America/Guatemala') =
+               DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Guatemala')
+          THEN admin_commission ELSE 0
+        END), 0) AS month_admin_commissions
       FROM platform_commissions
     `);
 
@@ -3477,6 +3482,18 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
       ORDER BY total_amount DESC
     `);
 
+    const volumeMonthRes = await pool.query(`
+      SELECT
+        UPPER(COALESCE(type, '')) AS type,
+        COUNT(*) AS tx_count,
+        COALESCE(SUM(amount), 0) AS total_amount
+      FROM transactions
+      WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Guatemala') =
+            DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Guatemala')
+      GROUP BY UPPER(COALESCE(type, ''))
+      ORDER BY total_amount DESC
+    `);
+
     const byRole = { client: 0, merchant: 0, agent: 0 };
     for (const row of balancesRes.rows) {
       const val = round2(parseFloat(row.total_balance || 0));
@@ -3488,19 +3505,54 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
     const totalThirdPartyBalances = round2(byRole.client + byRole.merchant + byRole.agent);
     const commRow = commissionsRes.rows[0] || {};
 
+    const monthNamesEs = [
+      'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+      'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+    ];
+    const gtNowParts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Guatemala',
+      year: 'numeric',
+      month: '2-digit'
+    }).formatToParts(new Date());
+    const gtYear = gtNowParts.find((p) => p.type === 'year')?.value || String(new Date().getFullYear());
+    const gtMonthIdx = Math.max(
+      0,
+      Math.min(11, parseInt(gtNowParts.find((p) => p.type === 'month')?.value || '1', 10) - 1)
+    );
+    const auditMonthLabel = `${monthNamesEs[gtMonthIdx]} ${gtYear}`;
+
+    const formattedMonthVolume = volumeMonthRes.rows.map((r) => ({
+      type: r.type,
+      tx_count: parseInt(r.tx_count || 0, 10),
+      total_amount: round2(parseFloat(r.total_amount || 0)).toFixed(2)
+    }));
+
+    const totalVolumeMonth = round2(
+      formattedMonthVolume.reduce((acc, item) => acc + parseFloat(item.total_amount || 0), 0)
+    );
+
     return res.json({
       success: true,
+      audit_period: {
+        month_name: monthNamesEs[gtMonthIdx],
+        year: Number(gtYear),
+        label: auditMonthLabel,
+        timezone: 'America/Guatemala'
+      },
       balances_by_role: byRole,
       total_third_party_balances: totalThirdPartyBalances,
       commissions: {
         today_admin: round2(parseFloat(commRow.today_admin_commissions || 0)).toFixed(2),
+        month_admin: round2(parseFloat(commRow.month_admin_commissions || 0)).toFixed(2),
         total_admin: round2(parseFloat(commRow.total_admin_commissions || 0)).toFixed(2)
       },
       volume_today: volumeTodayRes.rows.map((r) => ({
         type: r.type,
         tx_count: parseInt(r.tx_count || 0, 10),
         total_amount: round2(parseFloat(r.total_amount || 0)).toFixed(2)
-      }))
+      })),
+      volume_month: formattedMonthVolume,
+      total_volume_month: totalVolumeMonth.toFixed(2)
     });
   } catch (error) {
     console.error('Error en GET /api/admin/financial-overview:', error);
