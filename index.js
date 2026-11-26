@@ -3440,10 +3440,60 @@ app.get('/api/agent/commissions-summary', verifyToken, requireRole('AGENT'), asy
 });
 
 // ==========================================
-// ENDPOINT: GET /api/admin/financial-overview (Horario Guatemala + Auditoría Mensual)
+// ENDPOINT: GET /api/admin/financial-overview (Horario Guatemala + Meses Pasados)
 // ==========================================
 app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), async (req, res) => {
   try {
+    const monthNamesEs = [
+      'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+      'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+    ];
+
+    // Fecha actual en hora de Guatemala
+    const gtNowParts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Guatemala',
+      year: 'numeric',
+      month: '2-digit'
+    }).formatToParts(new Date());
+
+    const currentGtYear = parseInt(
+      gtNowParts.find((p) => p.type === 'year')?.value || String(new Date().getFullYear()),
+      10
+    );
+    const currentGtMonth = parseInt(
+      gtNowParts.find((p) => p.type === 'month')?.value || '1',
+      10
+    );
+
+    const parsedMonth = parseInt(req.query.month, 10);
+    const parsedYear = parseInt(req.query.year, 10);
+
+    const targetMonth =
+      Number.isInteger(parsedMonth) && parsedMonth >= 1 && parsedMonth <= 12
+        ? parsedMonth
+        : currentGtMonth;
+
+    const targetYear =
+      Number.isInteger(parsedYear) && parsedYear >= 2020 && parsedYear <= 2100
+        ? parsedYear
+        : currentGtYear;
+
+    // Primer día del mes consultado en Guatemala (ej. '2026-10-01')
+    const monthStartStr = `${targetYear}-${String(targetMonth).padStart(2, '0')}-01`;
+
+    // Opciones de los últimos 12 meses en hora de Guatemala para selector rápido
+    const availableMonths = [];
+    for (let i = 0; i < 12; i++) {
+      const d = new Date(Date.UTC(currentGtYear, currentGtMonth - 1 - i, 1));
+      const y = d.getUTCFullYear();
+      const m = d.getUTCMonth() + 1;
+      availableMonths.push({
+        year: y,
+        month: m,
+        label: `${monthNamesEs[m - 1]} ${y}`
+      });
+    }
+
     const balancesRes = await pool.query(`
       SELECT
         UPPER(COALESCE(role, '')) AS role,
@@ -3454,7 +3504,8 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
       GROUP BY UPPER(COALESCE(role, ''))
     `);
 
-    const commissionsRes = await pool.query(`
+    const commissionsRes = await pool.query(
+      `
       SELECT
         COALESCE(SUM(admin_commission), 0) AS total_admin_commissions,
         COALESCE(SUM(CASE
@@ -3464,11 +3515,13 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
         END), 0) AS today_admin_commissions,
         COALESCE(SUM(CASE
           WHEN DATE_TRUNC('month', created_at AT TIME ZONE 'America/Guatemala') =
-               DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Guatemala')
+               DATE_TRUNC('month', $1::date::timestamp)
           THEN admin_commission ELSE 0
-        END), 0) AS month_admin_commissions
+        END), 0) AS selected_month_admin_commissions
       FROM platform_commissions
-    `);
+      `,
+      [monthStartStr]
+    );
 
     const volumeTodayRes = await pool.query(`
       SELECT
@@ -3482,17 +3535,20 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
       ORDER BY total_amount DESC
     `);
 
-    const volumeMonthRes = await pool.query(`
+    const volumeMonthRes = await pool.query(
+      `
       SELECT
         UPPER(COALESCE(type, '')) AS type,
         COUNT(*) AS tx_count,
         COALESCE(SUM(amount), 0) AS total_amount
       FROM transactions
       WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Guatemala') =
-            DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Guatemala')
+            DATE_TRUNC('month', $1::date::timestamp)
       GROUP BY UPPER(COALESCE(type, ''))
       ORDER BY total_amount DESC
-    `);
+      `,
+      [monthStartStr]
+    );
 
     const byRole = { client: 0, merchant: 0, agent: 0 };
     for (const row of balancesRes.rows) {
@@ -3504,22 +3560,7 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
 
     const totalThirdPartyBalances = round2(byRole.client + byRole.merchant + byRole.agent);
     const commRow = commissionsRes.rows[0] || {};
-
-    const monthNamesEs = [
-      'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
-      'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
-    ];
-    const gtNowParts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'America/Guatemala',
-      year: 'numeric',
-      month: '2-digit'
-    }).formatToParts(new Date());
-    const gtYear = gtNowParts.find((p) => p.type === 'year')?.value || String(new Date().getFullYear());
-    const gtMonthIdx = Math.max(
-      0,
-      Math.min(11, parseInt(gtNowParts.find((p) => p.type === 'month')?.value || '1', 10) - 1)
-    );
-    const auditMonthLabel = `${monthNamesEs[gtMonthIdx]} ${gtYear}`;
+    const auditMonthLabel = `${monthNamesEs[targetMonth - 1]} ${targetYear}`;
 
     const formattedMonthVolume = volumeMonthRes.rows.map((r) => ({
       type: r.type,
@@ -3534,16 +3575,19 @@ app.get('/api/admin/financial-overview', verifyToken, requireRole('ADMIN'), asyn
     return res.json({
       success: true,
       audit_period: {
-        month_name: monthNamesEs[gtMonthIdx],
-        year: Number(gtYear),
+        month: targetMonth,
+        year: targetYear,
+        month_name: monthNamesEs[targetMonth - 1],
         label: auditMonthLabel,
+        is_current_month: targetMonth === currentGtMonth && targetYear === currentGtYear,
         timezone: 'America/Guatemala'
       },
+      available_months: availableMonths,
       balances_by_role: byRole,
       total_third_party_balances: totalThirdPartyBalances,
       commissions: {
         today_admin: round2(parseFloat(commRow.today_admin_commissions || 0)).toFixed(2),
-        month_admin: round2(parseFloat(commRow.month_admin_commissions || 0)).toFixed(2),
+        month_admin: round2(parseFloat(commRow.selected_month_admin_commissions || 0)).toFixed(2),
         total_admin: round2(parseFloat(commRow.total_admin_commissions || 0)).toFixed(2)
       },
       volume_today: volumeTodayRes.rows.map((r) => ({
