@@ -40,6 +40,11 @@ io.on('connection', (socket) => {
     console.log(`Agente unido a la sala: agent_${agentId}`);
   });
 
+  socket.on('join_admin_room', () => {
+  socket.join('admin_room');
+  console.log('Admin unido a la sala: admin_room');
+});
+
   socket.on('disconnect', () => {
     console.log('Socket desconectado:', socket.id);
   });
@@ -405,6 +410,10 @@ app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
 
         await client.query('COMMIT');
 
+        io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
+
         // Consultar nombres de emisor y receptor para el comprobante
         const userNamesRes = await client.query(
             'SELECT id, full_name, phone_number FROM users WHERE id = $1 OR id = $2',
@@ -603,6 +612,10 @@ app.post('/api/merchant/refund', verifyToken, requireRole('MERCHANT', 'COMERCIO'
         );
 
         await client.query('COMMIT');
+
+        io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
 
         if (clientId) {
             io.to(`client_${clientId}`).emit('transaction_update', {
@@ -878,6 +891,10 @@ app.post('/api/cash-in', verifyToken, requireRole('AGENT'), validarLimitesAML, a
       created_at: new Date()
     });
 
+    io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
+
     return res.json({
       success: true,
       new_balance: newBalance,
@@ -1146,6 +1163,10 @@ app.post('/api/cash-out', verifyToken, requireRole('AGENT'), validarLimitesAML, 
       commission: comisiones.comisionTotal,
       created_at: new Date()
     });
+
+    io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
 
     return res.json({
       success: true,
@@ -2281,6 +2302,10 @@ app.post('/api/client/pay-merchant', verifyToken, async (req, res) => {
 
         await client.query('COMMIT');
 
+        io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
+
         const receiptPayload = {
             folio: `TRX-${txResult.rows[0].id}`,
             id: txResult.rows[0].id,
@@ -2709,6 +2734,10 @@ app.post('/api/admin/balance-requests/:id/approve', verifyToken, requireRole('AD
 
     await client.query('COMMIT');
 
+    io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
+
     // Emitir actualización en tiempo real a la sala del agente
     const ioInstance =
       (typeof io !== 'undefined' && io) ||
@@ -2897,6 +2926,10 @@ app.post('/api/admin/complete-bank-withdrawal', verifyToken, requireRole('ADMIN'
         );
 
         await client.query('COMMIT');
+
+        io.to('admin_room').emit('financial_overview_updated', {
+  updated_at: new Date()
+});
 
         return res.json({
             success: true,
