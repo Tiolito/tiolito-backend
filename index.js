@@ -173,6 +173,105 @@ const requireRole = (...allowedRoles) => {
     };
 };
 
+// ==========================================
+// CONFIGURACIÓN DE LÍMITES AML/PLD (GUATEMALA)
+// ==========================================
+const LIMITE_POR_TRANSACCION_TIER1 = 2000.00;   
+const LIMITE_DIARIO_ACUMULADO_TIER1 = 5000.00;  
+const LIMITE_MENSUAL_ACUMULADO_TIER1 = 25000.00; 
+
+const LIMITE_POR_TRANSACCION_TIER2 = 10000.00;   
+const LIMITE_DIARIO_ACUMULADO_TIER2 = 25000.00;  
+const LIMITE_MENSUAL_ACUMULADO_TIER2 = 100000.00; 
+
+// Middleware para validar límites de prevención de lavado de dinero y riesgo con soporte para Tier 1 y Tier 2
+async function validarLimitesAML(req, res, next) {
+  try {
+    let clientId = req.user?.id;
+    let userTier = 1; // Por defecto asumimos Tier 1 (Estándar)
+
+    // 1. Si la petición viene autenticada por token, obtenemos ID y Tier del usuario
+    if (clientId) {
+      const userRes = await pool.query('SELECT id, tier FROM users WHERE id = $1', [clientId]);
+      if (userRes.rows.length > 0) {
+        userTier = Number(userRes.rows[0].tier || 1);
+      }
+    } else {
+      // 2. Si no hay token (ej. en Cash-In o Cash-Out), buscamos por el teléfono en el body
+      const phone_number = req.body.phone_number || req.body.client_phone || req.body.telefono || req.body.phone;
+      let userRes = await pool.query('SELECT id, tier FROM users WHERE phone_number = $1', [phone_number]);
+      if (userRes.rows.length === 0) {
+        userRes = await pool.query('SELECT id, tier FROM users WHERE telefono = $1', [phone_number]);
+      }
+
+      if (userRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Cliente no registrado en el sistema' });
+      }
+      clientId = userRes.rows[0].id;
+      userTier = Number(userRes.rows[0].tier || 1);
+    }
+
+    const amount = req.body.amount ?? req.body.monto ?? req.body.withdrawAmount ?? 0;
+    const montoNum = parseFloat(amount);
+
+    // 3. Validar que el monto ingresado sea un número positivo
+    if (isNaN(montoNum) || montoNum <= 0) {
+      return res.status(400).json({ error: 'Ingresa un monto válido mayor a 0.' });
+    }
+
+    // 4. Seleccionar los límites vigentes según el Tier del cliente
+    const limitePorTransaccion = (userTier === 2) ? LIMITE_POR_TRANSACCION_TIER2 : LIMITE_POR_TRANSACCION_TIER1;
+    const limiteDiarioAcumulado = (userTier === 2) ? LIMITE_DIARIO_ACUMULADO_TIER2 : LIMITE_DIARIO_ACUMULADO_TIER1;
+    const limiteMensualAcumulado = (userTier === 2) ? LIMITE_MENSUAL_ACUMULADO_TIER2 : LIMITE_MENSUAL_ACUMULADO_TIER1;
+
+    // 5. Validar límite individual por transacción
+    if (montoNum > limitePorTransaccion) {
+      const limiteFmt = limitePorTransaccion.toFixed(2);
+      return res.status(400).json({
+        error: `La operación excede el límite permitido de Q${limiteFmt} por transacción.`
+      });
+    }
+
+    // 6. Consultar acumulado diario y mensual de forma segura usando el clientId
+    const queryAcumulados = `
+      SELECT 
+        COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
+        COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
+      FROM transactions 
+      WHERE (
+  client_id::text = $1::text
+  OR (agent_id::text = $1::text AND UPPER(type) LIKE '%TRANSFER%')) `;
+
+    const result = await pool.query(queryAcumulados, [clientId]);
+    const row = result.rows[0] || { total_hoy: 0, total_mes: 0 };
+    const totalHoy = parseFloat(row.total_hoy) || 0;
+    const totalMes = parseFloat(row.total_mes) || 0;
+
+    // 7. Validar límite diario acumulado
+    if (totalHoy + montoNum > limiteDiarioAcumulado) {
+      const diarioFmt = limiteDiarioAcumulado.toFixed(2);
+      const hoyFmt = totalHoy.toFixed(2);
+      return res.status(400).json({
+        error: `La operación supera el límite diario permitido (Q${diarioFmt}). Acumulado hoy: Q${hoyFmt}.`
+      });
+    }
+
+    // 8. Validar límite mensual acumulado
+    if (totalMes + montoNum > limiteMensualAcumulado) {
+      const mesFmt = limiteMensualAcumulado.toFixed(2);
+      const totalMesFmt = totalMes.toFixed(2);
+      return res.status(400).json({
+        error: `La operación supera el límite mensual permitido (Q${mesFmt}). Acumulado este mes: Q${totalMesFmt}.`
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error('Error al validar límites AML:', error);
+    res.status(500).json({ error: 'Error interno al verificar los límites de seguridad' });
+  }
+} 
+
 const round2 = (val) => Math.round((Number(val) + Number.EPSILON) * 100) / 100;
 
 // ==========================================
@@ -1863,105 +1962,6 @@ app.post('/api/client/lookup-transaction', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// CONFIGURACIÓN DE LÍMITES AML/PLD (GUATEMALA)
-// ==========================================
-const LIMITE_POR_TRANSACCION_TIER1 = 2000.00;   
-const LIMITE_DIARIO_ACUMULADO_TIER1 = 5000.00;  
-const LIMITE_MENSUAL_ACUMULADO_TIER1 = 25000.00; 
-
-const LIMITE_POR_TRANSACCION_TIER2 = 10000.00;   
-const LIMITE_DIARIO_ACUMULADO_TIER2 = 25000.00;  
-const LIMITE_MENSUAL_ACUMULADO_TIER2 = 100000.00; 
-
-// Middleware para validar límites de prevención de lavado de dinero y riesgo con soporte para Tier 1 y Tier 2
-async function validarLimitesAML(req, res, next) {
-  try {
-    let clientId = req.user?.id;
-    let userTier = 1; // Por defecto asumimos Tier 1 (Estándar)
-
-    // 1. Si la petición viene autenticada por token, obtenemos ID y Tier del usuario
-    if (clientId) {
-      const userRes = await pool.query('SELECT id, tier FROM users WHERE id = $1', [clientId]);
-      if (userRes.rows.length > 0) {
-        userTier = Number(userRes.rows[0].tier || 1);
-      }
-    } else {
-      // 2. Si no hay token (ej. en Cash-In o Cash-Out), buscamos por el teléfono en el body
-      const phone_number = req.body.phone_number || req.body.client_phone || req.body.telefono || req.body.phone;
-      let userRes = await pool.query('SELECT id, tier FROM users WHERE phone_number = $1', [phone_number]);
-      if (userRes.rows.length === 0) {
-        userRes = await pool.query('SELECT id, tier FROM users WHERE telefono = $1', [phone_number]);
-      }
-
-      if (userRes.rows.length === 0) {
-        return res.status(404).json({ error: 'Cliente no registrado en el sistema' });
-      }
-      clientId = userRes.rows[0].id;
-      userTier = Number(userRes.rows[0].tier || 1);
-    }
-
-    const amount = req.body.amount ?? req.body.monto ?? req.body.withdrawAmount ?? 0;
-    const montoNum = parseFloat(amount);
-
-    // 3. Validar que el monto ingresado sea un número positivo
-    if (isNaN(montoNum) || montoNum <= 0) {
-      return res.status(400).json({ error: 'Ingresa un monto válido mayor a 0.' });
-    }
-
-    // 4. Seleccionar los límites vigentes según el Tier del cliente
-    const limitePorTransaccion = (userTier === 2) ? LIMITE_POR_TRANSACCION_TIER2 : LIMITE_POR_TRANSACCION_TIER1;
-    const limiteDiarioAcumulado = (userTier === 2) ? LIMITE_DIARIO_ACUMULADO_TIER2 : LIMITE_DIARIO_ACUMULADO_TIER1;
-    const limiteMensualAcumulado = (userTier === 2) ? LIMITE_MENSUAL_ACUMULADO_TIER2 : LIMITE_MENSUAL_ACUMULADO_TIER1;
-
-    // 5. Validar límite individual por transacción
-    if (montoNum > limitePorTransaccion) {
-      const limiteFmt = limitePorTransaccion.toFixed(2);
-      return res.status(400).json({
-        error: `La operación excede el límite permitido de Q${limiteFmt} por transacción.`
-      });
-    }
-
-    // 6. Consultar acumulado diario y mensual de forma segura usando el clientId
-    const queryAcumulados = `
-      SELECT 
-        COALESCE(SUM(CASE WHEN (created_at AT TIME ZONE 'America/Guatemala')::date = (NOW() AT TIME ZONE 'America/Guatemala')::date THEN amount ELSE 0 END), 0) AS total_hoy,
-        COALESCE(SUM(CASE WHEN EXTRACT(MONTH FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'America/Guatemala')) AND EXTRACT(YEAR FROM (created_at AT TIME ZONE 'America/Guatemala')) = EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'America/Guatemala')) THEN amount ELSE 0 END), 0) AS total_mes
-      FROM transactions 
-      WHERE (
-  client_id::text = $1::text
-  OR (agent_id::text = $1::text AND UPPER(type) LIKE '%TRANSFER%')) `;
-
-    const result = await pool.query(queryAcumulados, [clientId]);
-    const row = result.rows[0] || { total_hoy: 0, total_mes: 0 };
-    const totalHoy = parseFloat(row.total_hoy) || 0;
-    const totalMes = parseFloat(row.total_mes) || 0;
-
-    // 7. Validar límite diario acumulado
-    if (totalHoy + montoNum > limiteDiarioAcumulado) {
-      const diarioFmt = limiteDiarioAcumulado.toFixed(2);
-      const hoyFmt = totalHoy.toFixed(2);
-      return res.status(400).json({
-        error: `La operación supera el límite diario permitido (Q${diarioFmt}). Acumulado hoy: Q${hoyFmt}.`
-      });
-    }
-
-    // 8. Validar límite mensual acumulado
-    if (totalMes + montoNum > limiteMensualAcumulado) {
-      const mesFmt = limiteMensualAcumulado.toFixed(2);
-      const totalMesFmt = totalMes.toFixed(2);
-      return res.status(400).json({
-        error: `La operación supera el límite mensual permitido (Q${mesFmt}). Acumulado este mes: Q${totalMesFmt}.`
-      });
-    }
-
-    next();
-  } catch (error) {
-    console.error('Error al validar límites AML:', error);
-    res.status(500).json({ error: 'Error interno al verificar los límites de seguridad' });
-  }
-} 
-
-// ==========================================
 // ENDPOINTS PARA EL ROL DE COMERCIO (MERCHANT)
 // ==========================================
 
@@ -3276,50 +3276,79 @@ app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// 1. REGISTRO CON ENVÍO DE CÓDIGO POR WHATSAPP
-// ==========================================
-const allowDevCodes = process.env.ALLOW_DEV_CODES === 'true';
+const crypto = require('crypto');
 
+function normalizePhoneGT(rawPhone = '') {
+  const digits = String(rawPhone).replace(/\D/g, '');
+  if (digits.length === 8) return `502${digits}`;
+  return digits;
+}
+
+function generateOtpCode() {
+  return crypto.randomInt(100000, 1000000).toString();
+}
+
+// 1. REGISTRO CON ENVÍO DE CÓDIGO POR WHATSAPP
 app.post('/api/register', async (req, res) => {
   const { phone_number, pin, full_name } = req.body;
+  const normalizedPhone = normalizePhoneGT(phone_number);
 
-  if (!phone_number || !pin) {
-    return res.status(400).json({ success: false, error: "Teléfono y PIN son obligatorios" });
+  if (!normalizedPhone || !pin) {
+    return res.status(400).json({ success: false, error: 'Teléfono y PIN son obligatorios.' });
   }
 
   try {
-    const salt = await bcrypt.genSalt(10);
-    const pin_hash = await bcrypt.hash(pin, salt);
-    const userRole = 'CLIENT';
-
-    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-
-    await pool.query(
-      `INSERT INTO users (phone_number, pin_hash, full_name, role, balance, is_verified, verification_code) 
-       VALUES ($1, $2, $3, $4, $5, FALSE, $6) 
-       RETURNING id, phone_number, role`,
-      [phone_number, pin_hash, full_name || 'Usuario', userRole, 0.00, verificationCode]
+    const existing = await pool.query(
+      `SELECT id, is_verified FROM users WHERE phone_number = $1`,
+      [normalizedPhone]
     );
 
+    const verificationCode = generateOtpCode();
+
+    if (existing.rowCount > 0) {
+      if (existing.rows[0].is_verified) {
+        return res.status(400).json({ success: false, error: 'El número ya está registrado.' });
+      }
+
+      // Si existía pero NO estaba verificado, actualizamos PIN, nombre y código
+      const salt = await bcrypt.genSalt(10);
+      const pin_hash = await bcrypt.hash(pin, salt);
+
+      await pool.query(
+        `UPDATE users
+         SET pin_hash = $1, full_name = COALESCE($2, full_name), verification_code = $3
+         WHERE id = $4`,
+        [pin_hash, full_name || null, verificationCode, existing.rows[0].id]
+      );
+    } else {
+      const salt = await bcrypt.genSalt(10);
+      const pin_hash = await bcrypt.hash(pin, salt);
+
+      await pool.query(
+        `INSERT INTO users (phone_number, pin_hash, full_name, role, balance, is_verified, verification_code)
+         VALUES ($1, $2, $3, 'CLIENT', 0.00, FALSE, $4)`,
+        [normalizedPhone, pin_hash, full_name || 'Usuario', verificationCode]
+      );
+    }
+
     const waText = `Tu código de verificación para activar tu cuenta en Tiolito es: ${verificationCode}`;
-    const waResult = await sendWhatsAppOtp(phone_number, waText);
+    const waResult = await sendWhatsAppOtp(normalizedPhone, waText);
 
     return res.json({
       success: true,
       requires_verification: true,
-      whatsapp_sent: waResult.sent,
-      message: waResult.sent
+      whatsapp_sent: Boolean(waResult?.sent),
+      message: waResult?.sent
         ? 'Cuenta registrada. Te enviamos tu código por WhatsApp.'
-        : 'Cuenta registrada. Ingresa el código de verificación.',
+        : 'Cuenta registrada, pero no se pudo confirmar el envío por WhatsApp.',
       ...(allowDevCodes ? { dev_code: verificationCode } : {})
     });
   } catch (error) {
-    console.error("ERROR EN EL REGISTRO:", error);
+    console.error('ERROR EN EL REGISTRO:', error);
     if (error.code === '23505') {
-      return res.status(400).json({ success: false, error: "El número ya está registrado" });
+      return res.status(400).json({ success: false, error: 'El número ya está registrado.' });
     }
-    return res.status(500).json({ success: false, error: "Error interno al registrar la cuenta." });
+    return res.status(500).json({ success: false, error: 'Error interno al registrar la cuenta.' });
   }
 });
 
@@ -3362,35 +3391,44 @@ app.post('/api/auth/verify-code', async (req, res) => {
   }
 });
 
-// ==========================================
-// 3. SOLICITAR RECUPERACIÓN DE CONTRASEÑA POR WHATSAPP
-// ==========================================
+// 2. RECUPERACIÓN DE CONTRASEÑA POR WHATSAPP
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { phone_number } = req.body;
+  const normalizedPhone = normalizePhoneGT(phone_number);
+
+  if (!normalizedPhone) {
+    return res.status(400).json({ success: false, error: 'El número de teléfono es obligatorio.' });
+  }
 
   try {
-    const userResult = await pool.query(`SELECT id FROM users WHERE phone_number = $1`, [phone_number]);
+    const userResult = await pool.query(
+      `SELECT id FROM users WHERE phone_number = $1`,
+      [normalizedPhone]
+    );
+
     if (userResult.rowCount === 0) {
       return res.status(404).json({ success: false, error: 'No se encontró una cuenta con este número.' });
     }
 
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const resetCode = generateOtpCode();
 
     await pool.query(
-      `UPDATE users SET reset_code = $1, reset_expires = NOW() + INTERVAL '15 minutes' WHERE phone_number = $2`,
-      [resetCode, phone_number]
+      `UPDATE users
+       SET reset_code = $1, reset_expires = NOW() + INTERVAL '15 minutes'
+       WHERE id = $2`,
+      [resetCode, userResult.rows[0].id]
     );
 
     const waText = `Tu código para recuperar tu contraseña en Tiolito es: ${resetCode} (vigente por 15 minutos).`;
-    const waResult = await sendWhatsAppOtp(phone_number, waText);
+    const waResult = await sendWhatsAppOtp(normalizedPhone, waText);
 
     return res.json({
       success: true,
-      whatsapp_sent: waResult.sent,
-      message: waResult.sent
+      whatsapp_sent: Boolean(waResult?.sent),
+      message: waResult?.sent
         ? 'Código de recuperación enviado por WhatsApp.'
-        : 'Código de recuperación generado.',
-      ...(process.env.ALLOW_DEV_CODES === 'true' ? { dev_code: resetCode } : {})
+        : 'Código generado, pero no se pudo confirmar el envío por WhatsApp.',
+      ...(allowDevCodes ? { dev_code: resetCode } : {})
     });
   } catch (error) {
     console.error('Error en forgot-password:', error);
