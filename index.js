@@ -288,6 +288,55 @@ app.get('/api/transactions/:user_id', verifyToken, async (req, res) => {
 const normalizePhone = (phone) => String(phone || '').replace(/\D/g, '').trim();
 
 // ==========================================
+// ENVÍO AUTOMÁTICO POR WHATSAPP CLOUD API
+// ==========================================
+const formatGuatemalaWaPhone = (rawPhone) => {
+  const digits = String(rawPhone || '').replace(/\D/g, '');
+  if (!digits) return '';
+  return digits.length === 8 ? `502${digits}` : digits;
+};
+
+async function sendWhatsAppOtp(rawPhone, messageText) {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  const apiVersion = process.env.WHATSAPP_API_VERSION || 'v25.0';
+  const toPhone = formatGuatemalaWaPhone(rawPhone);
+
+  if (!phoneNumberId || !accessToken || !toPhone) {
+    console.warn('⚠️ WhatsApp API no configurada o teléfono inválido para envío automático.');
+    return { sent: false, reason: 'missing_config' };
+  }
+
+  const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to: toPhone,
+      type: 'text',
+      text: {
+        preview_url: false,
+        body: messageText
+      }
+    })
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    console.error('❌ Error de WhatsApp Cloud API:', JSON.stringify(data));
+    return { sent: false, error: data };
+  }
+
+  return { sent: true, data };
+}
+
+// ==========================================
 // 5. ENDPOINT: POST /api/transfer (Transferencia P2P por Teléfono)
 // ==========================================
 app.post('/api/transfer', verifyToken, validarLimitesAML, async (req, res) => {
@@ -3228,7 +3277,7 @@ app.delete('/api/user/withdrawals/:id', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// 1. REGISTRO CON ENVÍO DE CÓDIGO DE VERIFICACIÓN
+// 1. REGISTRO CON ENVÍO DE CÓDIGO POR WHATSAPP
 // ==========================================
 const allowDevCodes = process.env.ALLOW_DEV_CODES === 'true';
 
@@ -3244,7 +3293,6 @@ app.post('/api/register', async (req, res) => {
     const pin_hash = await bcrypt.hash(pin, salt);
     const userRole = 'CLIENT';
 
-    // Generar código aleatorio de 6 dígitos
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
     await pool.query(
@@ -3254,22 +3302,16 @@ app.post('/api/register', async (req, res) => {
       [phone_number, pin_hash, full_name || 'Usuario', userRole, 0.00, verificationCode]
     );
 
-    // 🌟 ZONA DE ENVÍO DE MENSAJE (MODO PRUEBA JSON / LISTO PARA TWILIO)
-    /* 
-      TODO PARA PRODUCCIÓN (TWILIO):
-      const twilio = require('twilio');
-      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      await client.messages.create({
-          body: `Tu código de verificación Tiolito es: ${verificationCode}`,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: `+502${phone_number}`
-      });
-    */
+    const waText = `Tu código de verificación para activar tu cuenta en Tiolito es: ${verificationCode}`;
+    const waResult = await sendWhatsAppOtp(phone_number, waText);
 
     return res.json({
       success: true,
       requires_verification: true,
-      message: 'Cuenta registrada. Ingresa el código de verificación.',
+      whatsapp_sent: waResult.sent,
+      message: waResult.sent
+        ? 'Cuenta registrada. Te enviamos tu código por WhatsApp.'
+        : 'Cuenta registrada. Ingresa el código de verificación.',
       ...(allowDevCodes ? { dev_code: verificationCode } : {})
     });
   } catch (error) {
@@ -3321,42 +3363,39 @@ app.post('/api/auth/verify-code', async (req, res) => {
 });
 
 // ==========================================
-// 3. SOLICITAR RECUPERACIÓN DE CONTRASEÑA
+// 3. SOLICITAR RECUPERACIÓN DE CONTRASEÑA POR WHATSAPP
 // ==========================================
 app.post('/api/auth/forgot-password', async (req, res) => {
-    const { phone_number } = req.body;
+  const { phone_number } = req.body;
 
-    try {
-        const userResult = await pool.query(`SELECT id FROM users WHERE phone_number = $1`, [phone_number]);
-        if (userResult.rowCount === 0) {
-            return res.status(404).json({ success: false, error: 'No se encontró una cuenta con este número.' });
-        }
-
-        const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-
-        await pool.query(
-            `UPDATE users SET reset_code = $1, reset_expires = NOW() + INTERVAL '15 minutes' WHERE phone_number = $2`,
-            [resetCode, phone_number]
-        );
-
-        /* 
-          TODO PARA PRODUCCIÓN (TWILIO):
-          await client.messages.create({
-              body: `Tu código para recuperar contraseña en Tiolito es: ${resetCode}`,
-              from: process.env.TWILIO_PHONE_NUMBER,
-              to: `+502${phone_number}`
-          });
-        */
-
-        return res.json({
-            success: true,
-            message: 'Código de recuperación generado.',
-            ...(process.env.ALLOW_DEV_CODES === 'true' ? { dev_code: resetCode } : {})
-        });
-    } catch (error) {
-        console.error('Error en forgot-password:', error);
-        return res.status(500).json({ success: false, error: 'Error interno del servidor.' });
+  try {
+    const userResult = await pool.query(`SELECT id FROM users WHERE phone_number = $1`, [phone_number]);
+    if (userResult.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'No se encontró una cuenta con este número.' });
     }
+
+    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    await pool.query(
+      `UPDATE users SET reset_code = $1, reset_expires = NOW() + INTERVAL '15 minutes' WHERE phone_number = $2`,
+      [resetCode, phone_number]
+    );
+
+    const waText = `Tu código para recuperar tu contraseña en Tiolito es: ${resetCode} (vigente por 15 minutos).`;
+    const waResult = await sendWhatsAppOtp(phone_number, waText);
+
+    return res.json({
+      success: true,
+      whatsapp_sent: waResult.sent,
+      message: waResult.sent
+        ? 'Código de recuperación enviado por WhatsApp.'
+        : 'Código de recuperación generado.',
+      ...(process.env.ALLOW_DEV_CODES === 'true' ? { dev_code: resetCode } : {})
+    });
+  } catch (error) {
+    console.error('Error en forgot-password:', error);
+    return res.status(500).json({ success: false, error: 'Error interno del servidor.' });
+  }
 });
 
 // ==========================================
