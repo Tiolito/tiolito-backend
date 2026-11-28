@@ -2549,28 +2549,29 @@ app.post('/api/agent/balance-requests', verifyToken, requireRole('AGENT'), async
   const agentId = String(req.user.id);
   const rawAmount = parseFloat(req.body.amount);
   const amount = Number.isFinite(rawAmount) ? round2(rawAmount) : NaN;
-  const bankName = String(req.body.bank_name || '').trim();
-  const referenceNumber = String(req.body.reference_number || '').trim();
+  const bankName = String(req.body.bank_name || '').trim().replace(/\s+/g, ' ');
+  const referenceNumber = String(req.body.reference_number || '').trim().toUpperCase();
+  const normalizedRef = referenceNumber.replace(/[\s-]/g, '');
   const notes = req.body.notes ? String(req.body.notes).trim() : null;
 
   if (Number.isNaN(amount) || amount <= 0) {
     return res.status(400).json({ success: false, error: 'Ingresa un monto válido mayor a Q0.00.' });
   }
 
-  if (!bankName || !referenceNumber) {
+  if (!bankName || !referenceNumber || !normalizedRef) {
     return res.status(400).json({ success: false, error: 'Ingresa el banco/canal y el número de boleta o referencia.' });
   }
 
   try {
-    // Evitar reutilizar la misma referencia/boleta en solicitudes pendientes o ya aprobadas
+    // Evitar reutilizar la misma referencia/boleta en solicitudes pendientes o ya aprobadas (ignorando espacios y guiones)
     const dupRes = await pool.query(
       `SELECT id, status
        FROM agent_balance_requests
-       WHERE UPPER(TRIM(reference_number)) = UPPER($1)
-         AND UPPER(TRIM(bank_name)) = UPPER($2)
+       WHERE REGEXP_REPLACE(UPPER(TRIM(reference_number)), '[\\s-]', '', 'g') = $1
+         AND UPPER(REGEXP_REPLACE(TRIM(bank_name), '\\s+', ' ', 'g')) = UPPER($2)
          AND status IN ('PENDING', 'APPROVED')
        LIMIT 1`,
-      [referenceNumber, bankName]
+      [normalizedRef, bankName]
     );
 
     if (dupRes.rows.length > 0) {
@@ -2593,6 +2594,12 @@ app.post('/api/agent/balance-requests', verifyToken, requireRole('AGENT'), async
       message: 'Solicitud de recarga enviada. Queda pendiente de validación por administración.'
     });
   } catch (error) {
+    if (error && error.code === '23505') {
+      return res.status(400).json({
+        success: false,
+        error: 'Ese número de boleta o referencia ya fue registrado para este banco.'
+      });
+    }
     console.error('Error al crear solicitud de recarga de agente:', error);
     return res.status(500).json({ success: false, error: 'Error interno al enviar la solicitud.' });
   }
